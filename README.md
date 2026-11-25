@@ -4,20 +4,23 @@ For those who say it's not possible, the intention is to complete this emulator 
 It's necessary to thoroughly debug each set of instructions so that the interpretation is 100% correct, using a modular, scalable, and best-practice style (in most cases).
 
 # Implemented
-* Display and Framebuffer support with Java native and OpenGL (JOGL)
+* Display and Framebuffer support with Java native 
 * MemoryDevice and RAM
 * CPU (supporting most instructions and opcodes )
 * Files (ELF32, ELF64 and RAW)
 
 # TO DO
 * Controllers (joystick support)
-* SMC support
-* NAND support
-* Hard disk and USB management
+* SMC support (done)
+* NAND support (done)
+* Hard disk and USB management (done by emulation)
 * Improve coding to make it cleaner and more debuggable
 
  # Disclaimer
  <b>This is a parallel project of <a href="https://github.com/xenon-emu/xenon">Xenon</a>, it is not related in any way to the aforementioned.</b>
 
  # Capture 
-![xbox360Fb](https://github.com/user-attachments/assets/c5493f10-4aa7-499b-a8c5-61791e30e768)
+<img width="951" height="748" alt="imagen" src="https://github.com/user-attachments/assets/150bbadb-10f7-448a-a36c-39f6cc23a3fa" />
+
+Without the required data
+<img width="632" height="353" alt="imagen" src="https://github.com/user-attachments/assets/f4897f94-d322-495f-a428-d2f965775ae8" />
