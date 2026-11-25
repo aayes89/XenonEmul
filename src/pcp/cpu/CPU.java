@@ -1,0 +1,3986 @@
+/*
+ * The MIT License
+ *
+ * Copyright 2025 Slam.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
+package pcp.cpu;
+
+import pcp.system.ExceptionHandler;
+import pcp.system.MMU;
+import pcp.system.CacheController;
+import pcp.cpu.Instruction.Logical;
+import pcp.system.Bus;
+import pcp.utils.DecodingInstr;
+import pcp.utils.ELFFile;
+
+/**
+ *
+ * @author Slam
+ */
+public class CPU {
+
+    /**
+     * Host bridge para llamadas de sistema PPC (sc) originadas por import
+     * thunks.
+     */
+    @FunctionalInterface
+    public interface SystemCallHandler {
+
+        long invoke(CPU cpu, int serviceNumber);
+    }
+
+    private volatile SystemCallHandler systemCallHandler;
+
+    public void setSystemCallHandler(SystemCallHandler handler) {
+        this.systemCallHandler = handler;
+    }
+
+    private final Bus bus;
+    // Variable para modo debug
+    boolean debugMode = false;
+
+    private boolean interruptPending = false;
+    private int machine;
+    // Registros
+    private long pc;
+    private long acc; // Accumulator
+    // Registros de propÃ³sito general (r0-r31)
+    private long[] gpr = new long[32];
+    // Registro de condiciÃ³n (CR: 32 bits, 8 campos de 4 bits)
+    private long cr;
+    private long lr;   // Link Register
+    private long ctr;  // Count Register (64 bits)
+    private long xer;  // Fixed-Point Exception Register (SO, OV, CA)
+    private long msr;      // Machine State Register
+    private long srr0;     // Save/Restore Register 0
+    private long srr1;     // Save/Restore Register 1
+    private int sprg0;    // Special Purpose Register General 0
+    private int sprg1;    // Special Purpose Register General 1
+    private int sprg2;    // Special Purpose Register General 2
+    private int sprg3;    // Special Purpose Register General 3
+    private long hrmorValue;
+    private long hid1Value;
+    private long tlbSPR3B3;
+    private long tlbSPR3B4;
+    private long tlbSPR3B5;
+    private long msrValue;
+    private int SDR1;
+    private int MQ;     // m quotient
+    private int RTCU, RTCL;
+    private int EAR;
+    private int TBL, TBU;
+    private int IBAT0U, IBAT0L, IBAT1U, IBAT1L, IBAT2U, IBAT2L, IBAT3U, IBAT3L;
+    private int DBAT0U, DBAT0L, DBAT1U, DBAT1L, DBAT2U, DBAT2L, DBAT3U, DBAT3L;
+    private long dar;  // Data Address Register
+    private long dsisr; // Data Storage Interrupt Status Register
+    private int pvr;  // Processor Version Register
+    private long timeBase; // CombinaciÃ³n de TBU y TBL (64 bits)
+    private int dec;       // Decrementer
+    private long fpscr; // Floating-Point Status and Control Register
+    private long vscr;  // Vector Status and Control Register
+
+    private boolean interruptMode;
+    private double[] fpr = new double[32];
+    private int[][] vr = new int[32][4];
+    private int[] sr = new int[16];
+    private long reserveAddress = -1;
+    private boolean dumpedStall = false;
+
+    // MÃ¡scaras para bits del XER    
+    public static final int XER_SO = 0x80000000; // Summary Overflow (bit 0 PPC)
+    public static final int XER_OV = 0x40000000; // Overflow
+    public static final int XER_CA = 0x20000000; // Carry
+    // Bits del MSR
+    // Definir constantes para MSR
+    //public static final int MSR_EE = 0x8000; // External Interrupt Enable
+    public static final int MSR_PR = 1 << 14; // Problem State
+    public static final int MSR_EE = 1 << 15; // External Interrupt Enable
+    public static final int MSR_FP = 1 << 13; // Floating-Point Available    
+    public static final int MSR_IR = 1 << 5; // 0x20
+    public static final int MSR_DR = 1 << 4; // 0x10
+
+    // Bits del FPSCR
+    public static final int FPSCR_FX = 1 << 31; // Floating-Point Exception Summary
+    public static final int FPSCR_FEX = 1 << 30; // Floating-Point Enabled Exception Summary
+    public static final int FPSCR_VX = 1 << 29; // Floating-Point Invalid Operation Exception Summary
+    public static final int FPSCR_OX = 1 << 28; // Floating-Point Overflow Exception
+    public static final int FPSCR_UX = 1 << 27; // Floating-Point Underflow Exception
+    public static final int FPSCR_ZX = 1 << 26; // Floating-Point Zero Divide Exception
+    public static final int FPSCR_XX = 1 << 25; // Floating-Point Inexact Exception
+    public static final int FPSCR_VXSNAN = 1 << 24; // Invalid Operation Exception (SNaN)
+    public static final int FPSCR_VXSQRT = 0x00000400;
+
+    // Logical remains a shared helper for condition-register operations.
+    private final Logical logical;
+    private final ExceptionHandler exceptionHandler;
+    private final MMU mmu;
+    private final CacheController cache;
+
+    public CPU(Bus bus, CacheController cache) {
+        this.bus = bus;
+        this.cache = cache;
+        this.mmu = new MMU(this);
+        this.logical = new Logical(this);
+        this.exceptionHandler = new ExceptionHandler(this);
+    }
+
+    // =====================================================================
+    // NÃºcleo de ejecuciÃ³n PowerPC 64 bits (modo SF=1 como el Xenon real).
+    // Los GPR son de 64 bits; las instrucciones "de palabra" siguen la ISA.
+    // Los accesos a memoria usan los 32 bits bajos de la direcciÃ³n efectiva.
+    // =====================================================================
+    private static final long M32 = 0xFFFFFFFFL;
+    private long nextPc;
+
+    // Trazado puntual de llamadas hacia el .text de bootanim.xex.
+    private static final long BOOTANIM_TEXT_START = 0x9800E000L;
+    private static final long BOOTANIM_TEXT_END = 0x9805733CL;
+    private final java.util.Set<Long> tracedBootAnimationCallSites = new java.util.HashSet<>();
+
+    private static boolean isBootAnimationText(long address) {
+        long a = address & 0xFFFFFFFFL;
+        return a >= BOOTANIM_TEXT_START && a < BOOTANIM_TEXT_END;
+    }
+
+    private void traceBootAnimationCall(int insn, int op) {
+        boolean linkedBranch = false;
+        if (op == 16 || op == 18) {
+            linkedBranch = (insn & 1) != 0;
+        } else if (op == 19) {
+            int xo = (insn >>> 1) & 0x3FF;
+            linkedBranch = (xo == 16 || xo == 528) && (insn & 1) != 0;
+        }
+        long key = ((pc & 0xFFFFFFFFL) << 32) | (nextPc & 0xFFFFFFFFL);
+        if (!linkedBranch || !isBootAnimationText(nextPc)
+                || !tracedBootAnimationCallSites.add(key)) {
+            return;
+        }
+        System.out.printf(
+                "[BOOTANIM-CALL] CPU=%d FROM=%08X TO=%08X INS=%08X LR=%08X r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X r1=%08X%n",
+                pir, pc, nextPc, insn, lr,
+                (int) gpr[3], (int) gpr[4], (int) gpr[5], (int) gpr[6],
+                (int) gpr[7], (int) gpr[8], (int) gpr[9], (int) gpr[10], (int) gpr[1]);
+    }
+
+    private long addressWidth(long address) {
+        return sf() ? address : address & M32;
+    }
+    private boolean decPending = false;
+    private volatile boolean halted = false;
+    private long instructionCount = 0;
+    private boolean haltOnSelfBranch = true;
+    // Ring buffer de instrucciones realmente obtenidas por fetch desde la RAM invitada.
+    private static final int EXEC_TRACE_CAPACITY = 256;
+    private final long[] execTracePc = new long[EXEC_TRACE_CAPACITY];
+    private final int[] execTraceOpcode = new int[EXEC_TRACE_CAPACITY];
+    private int execTraceWrite;
+    private int execTraceSize;
+
+    public synchronized long[][] getExecutionTrace() {
+        long[][] out = new long[execTraceSize][2];
+        int start = (execTraceWrite - execTraceSize + EXEC_TRACE_CAPACITY) % EXEC_TRACE_CAPACITY;
+        for (int i = 0; i < execTraceSize; i++) {
+            int at = (start + i) % EXEC_TRACE_CAPACITY;
+            out[i][0] = execTracePc[at];
+            out[i][1] = execTraceOpcode[at] & 0xFFFFFFFFL;
+        }
+        return out;
+    }
+
+    /**
+     * Ãšltima direcciÃ³n registrada por el trazador de ejecuciÃ³n, o -1.
+     */
+    public synchronized long getLastExecutedPc() {
+        if (execTraceSize == 0) {
+            return -1L;
+        }
+        int at = (execTraceWrite - 1 + EXEC_TRACE_CAPACITY) % EXEC_TRACE_CAPACITY;
+        return execTracePc[at];
+    }
+
+    /**
+     * Opcode asociado a getLastExecutedPc().
+     */
+    public synchronized int getLastExecutedOpcode() {
+        if (execTraceSize == 0) {
+            return 0;
+        }
+        int at = (execTraceWrite - 1 + EXEC_TRACE_CAPACITY) % EXEC_TRACE_CAPACITY;
+        return execTraceOpcode[at];
+    }
+
+    private synchronized void recordExecution(long address, int opcode) {
+        execTracePc[execTraceWrite] = address;
+        execTraceOpcode[execTraceWrite] = opcode;
+        execTraceWrite = (execTraceWrite + 1) % EXEC_TRACE_CAPACITY;
+        if (execTraceSize < EXEC_TRACE_CAPACITY) {
+            execTraceSize++;
+        }
+    }
+    private final long[] sprOther = new long[1024];
+    private long lastIllegalInsn = 0;
+
+    public void setTrace(boolean t) {
+        debugMode = t;
+    }
+
+    public boolean isHalted() {
+        return halted;
+    }
+
+    public void halt() {
+        halted = true;
+    }
+
+    public void resume() {
+        halted = false;
+    }
+
+    public long getInstructionCount() {
+        return instructionCount;
+    }
+
+    /**
+     * Ãšltima instrucciÃ³n ilegal capturada por el decodificador.
+     */
+    public long getLastIllegalInsn() {
+        return lastIllegalInsn;
+    }
+
+    public void setHaltOnSelfBranch(boolean v) {
+        haltOnSelfBranch = v;
+    }
+
+    private long r(int n) {
+        return gpr[n];
+    }
+
+    private void w(int n, long v) {
+        gpr[n] = v;
+    }
+
+    private long ra0(int ra) {
+        return ra == 0 ? 0 : gpr[ra];
+    }
+
+    private static final long MSR_SF = 0x8000000000000000L;
+
+    /**
+     * MSR[SF]: modo de 64 bits. Con SF=0 las comparaciones, CR0,
+     * acarreo/overflow y CTR usan 32 bits.
+     */
+    private boolean sf() {
+        return (msr & MSR_SF) != 0;
+    }
+
+    private int crBit(int bi) {
+        return (int) ((cr >>> (31 - bi)) & 1);
+    }
+
+    private void crSetBit(int bi, int v) {
+        int sh = 31 - bi;
+        cr = ((cr & ~(1L << sh)) | ((long) (v & 1) << sh)) & M32;
+    }
+
+    private void crSetField(int f, int v) {
+        int sh = (7 - f) * 4;
+        cr = ((cr & ~(0xFL << sh)) | ((long) (v & 0xF) << sh)) & M32;
+    }
+
+    private void cmpCR(int crf, int cmp) {
+        int f = cmp < 0 ? 8 : (cmp > 0 ? 4 : 2);
+        if ((xer & 0x80000000L) != 0) {
+            f |= 1;
+        }
+        crSetField(crf, f);
+    }
+
+    private void cr0(long v) {
+        cmpCR(0, sf() ? Long.signum(v) : Integer.signum((int) v));
+    }
+
+    private int caIn() {
+        return (xer & 0x20000000L) != 0 ? 1 : 0;
+    }
+
+    private void setCAf(boolean c) {
+        xer = c ? (xer | 0x20000000L) : (xer & ~0x20000000L);
+    }
+
+    private void setOVf(boolean ov) {
+        xer = ov ? (xer | 0xC0000000L) : (xer & ~0x40000000L);
+    }
+
+    /**
+     * MÃ¡scara con numeraciÃ³n PowerPC de 64 bits (bit 0 = MSB).
+     */
+    private static long mask64(int mb, int me) {
+        long a = -1L >>> mb;
+        long b = -1L << (63 - me);
+        return mb <= me ? (a & b) : (a | b);
+    }
+
+    private static boolean isXOArith(int x9) {
+        switch (x9) {
+            case 8:
+            case 9:
+            case 10:
+            case 11:
+            case 40:
+            case 73:
+            case 75:
+            case 104:
+            case 136:
+            case 138:
+            case 200:
+            case 202:
+            case 232:
+            case 233:
+            case 234:
+            case 235:
+            case 266:
+            case 457:
+            case 459:
+            case 489:
+            case 491:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * rD = a + b + cin (64 bits) con carry/overflow/Rc opcionales.
+     */
+    private void arith(int rd, long a, long b, int cin, boolean setCA, boolean oe, boolean rc) {
+        if (!sf()) { // modo de 32 bits
+            long t = (a & M32) + (b & M32) + cin;
+            int r32 = (int) t;
+            w(rd, r32 & M32);
+            if (setCA) {
+                setCAf((t >>> 32) != 0);
+            }
+            if (oe) {
+                setOVf(((~((int) a ^ (int) b)) & ((int) a ^ r32)) < 0);
+            }
+            if (rc) {
+                cr0(r32);
+            }
+            return;
+        }
+        long res = a + b + cin;
+        w(rd, res);
+        if (setCA) {
+            setCAf(cin == 0 ? Long.compareUnsigned(res, a) < 0 : Long.compareUnsigned(res, a) <= 0);
+        }
+        if (oe) {
+            setOVf(((~(a ^ b)) & (a ^ res)) < 0);
+        }
+        if (rc) {
+            cr0(res);
+        }
+    }
+
+    private boolean trapCond(int to, long a, long b) {
+        return ((to & 16) != 0 && a < b) || ((to & 8) != 0 && a > b) || ((to & 4) != 0 && a == b)
+                || ((to & 2) != 0 && Long.compareUnsigned(a, b) < 0)
+                || ((to & 1) != 0 && Long.compareUnsigned(a, b) > 0);
+    }
+
+    private long ea(int ra, long d) {
+        return ra0(ra) + d;
+    }
+
+    private long eaX(int ra, int rb) {
+        return ra0(ra) + r(rb);
+    }
+
+    public long readMemoryDouble(long ea) {
+        return ((readMemoryWord(ea) & 0xFFFFFFFFL) << 32) | (readMemoryWord(ea + 4) & 0xFFFFFFFFL);
+    }
+
+    public void writeMemoryDouble(long ea, long v) {
+        writeMemoryWord(ea, v >>> 32);
+        writeMemoryWord(ea + 4, v & M32);
+    }
+
+    /**
+     * size: 1,2,4,8. sign: extensiÃ³n de signo (lha/lwa).
+     */
+    private void doLoad(int size, boolean sign, int rd, long ea) {
+        long v;
+        switch (size) {
+            case 1:
+                v = readMemoryByte(ea) & 0xFF;
+                break;
+            case 2:
+                v = readMemoryHalf(ea) & 0xFFFF;
+                if (sign) {
+                    v = (short) v;
+                }
+                break;
+            case 4:
+                v = readMemoryWord(ea);
+                if (sign) {
+                    v = (int) v;
+                }
+                break;
+            default:
+                v = readMemoryDouble(ea);
+        }
+        w(rd, v);
+    }
+
+    private void doStore(int size, long v, long ea) {
+        switch (size) {
+            case 1:
+                writeMemoryByte(ea, (byte) v);
+                break;
+            case 2:
+                writeMemoryHalf(ea, (int) v);
+                break;
+            case 4:
+                writeMemoryWord(ea, v & M32);
+                break;
+            default:
+                writeMemoryDouble(ea, v);
+        }
+    }
+
+    private int pir = 0;
+
+    public void setPir(int p) {
+        pir = p;
+    }
+
+    public int getPir() {
+        return pir;
+    }
+
+    public long getHRMOR() {
+        return hrmorValue;
+    }
+
+    public void setHrmorValue(long v) {
+        hrmorValue = v;
+    }
+
+    public long getHID1() {
+        return hid1Value;
+    }
+
+    public void setHid1Value(long v) {
+        hid1Value = v;
+    }
+
+    public long getTlbSPR3B3() {
+        return tlbSPR3B3;
+    }
+
+    public void setTlbSPR3B3(long v) {
+        tlbSPR3B3 = v;
+    }
+
+    public long getTlbSPR3B4() {
+        return tlbSPR3B4;
+    }
+
+    public void setTlbSPR3B4(long v) {
+        tlbSPR3B4 = v;
+    }
+
+    public long getTlbSPR3B5() {
+        return tlbSPR3B5;
+    }
+
+    public void setTlbSPR3B5(long v) {
+        tlbSPR3B5 = v;
+    }
+
+    /**
+     * true entre un lwarx/ldarx y su stwcx./stdcx. (el planificador no debe
+     * cambiar de hilo ahÃ­).
+     */
+    public boolean hasReservation() {
+        return reserveAddress != -1;
+    }
+
+    private boolean sprTrace = false;
+    private final java.util.Set<String> sprSeen = new java.util.HashSet<>();
+
+    private final java.util.Set<Long> watchPcs = new java.util.HashSet<>();
+
+    /**
+     * DiagnÃ³stico: imprime registros cada vez que el PC alcanza esta
+     * direcciÃ³n (se compara con los 32 bits bajos).
+     */
+    public void addWatchPc(long a) {
+        watchPcs.add(a & 0xFFFFFFFFL & 0x1FFFFFFFL);
+    }
+
+    private void watchDump() {
+        System.out.printf("[watch] hilo %d PC=0x%x LR=0x%x CTR=0x%x r1=0x%x r3=0x%x r4=0x%x r5=0x%x r6=0x%x r7=0x%x%n",
+                pir, pc, lr, ctr, gpr[1], gpr[3], gpr[4], gpr[5], gpr[6], gpr[7]);
+    }
+
+    public void setSprTrace(boolean t) {
+        sprTrace = t;
+    }
+
+    /**
+     * Configura un SPR genÃ©rico (Ãºtil para TLB y otros SPR no mapeados).
+     */
+    public void setSpr(int spr, long v) {
+        if (spr >= 0 && spr < sprOther.length) {
+            sprOther[spr] = v;
+        }
+    }
+
+    private void sprLog(String k, int spr, long v) {
+        if (sprTrace && sprSeen.add(k + spr + ":" + Long.toHexString(v))) {
+            System.out.printf("[spr] %s SPR %d (0x%x) valor=0x%x pc=0x%x%n", k, spr, spr, v, pc);
+        }
+    }
+
+    private long getSPR(int spr) {
+        switch (spr) {
+            case 1:
+                return xer;
+            case 8:
+                return lr;
+            case 9:
+                return ctr;
+            case 18:
+                return dsisr;
+            case 19:
+                return dar;
+            case 22:
+                return dec & M32;
+            case 25:
+                return SDR1 & M32;
+            case 26:
+                return srr0;
+            case 27:
+                return srr1;
+            case 0x139:
+                return hrmorValue;
+
+            case 0x3F1:
+                return hid1Value;
+
+            case 0x3B2:
+            case 0x3B3:
+            case 0x3B4:
+            case 0x3B5:
+                return sprOther[spr];
+            case 268:
+            case 284:
+                return timeBase & M32; // TBL: 32 bits inferiores
+            case 269:
+            case 285:
+                return (timeBase >>> 32) & M32; // TBU: 32 bits superiores
+            case 272:
+                return sprg0 & M32;
+            case 273:
+                return sprg1 & M32;
+            case 274:
+                return sprg2 & M32;
+            case 275:
+                return sprg3 & M32;
+            case 287:
+                return pvr & M32;
+            case 1023:
+                return pir; // PIR: Ã­ndice del hilo hardware
+            default:
+                sprLog("mfspr", spr, spr >= 0 && spr < sprOther.length ? sprOther[spr] : 0);
+                return spr >= 0 && spr < sprOther.length ? sprOther[spr] : 0;
+        }
+    }
+
+    private void setSPR(int spr, long v) {
+        switch (spr) {
+            case 1:
+                xer = v & M32;
+                break;
+
+            case 8:
+                lr = v;
+                break;
+
+            case 9:
+                ctr = v;
+                break;
+
+            case 18:
+                dsisr = v & M32;
+                break;
+
+            case 19:
+                dar = v;
+                break;
+
+            case 22:
+                dec = (int) v;
+                decPending = false;
+                break;
+
+            case 25:
+                SDR1 = (int) v;
+                break;
+
+            case 26:
+                srr0 = v;
+                break;
+
+            case 27:
+                srr1 = v;
+                break;
+
+            case 272:
+                sprg0 = (int) v;
+                break;
+
+            case 273:
+                sprg1 = (int) v;
+                break;
+
+            case 274:
+                sprg2 = (int) v;
+                break;
+
+            case 275:
+                sprg3 = (int) v;
+                break;
+
+            case 284:
+                timeBase = (timeBase & ~M32) | (v & M32);
+                break;
+
+            case 285:
+                timeBase = (timeBase & M32) | (v << 32);
+                break;
+
+            // HRMOR
+            case 0x139:
+                hrmorValue = v;
+                sprOther[spr] = v;
+                sprLog("HRMOR", spr, v);
+                System.out.printf("[CB_A-SPR] HRMOR=0x%016X PC=0x%016X%n", v, pc);
+                break;
+
+            // HID1
+            case 0x3F1:
+                hid1Value = v;
+                sprOther[spr] = v;
+                sprLog("HID1", spr, v);
+                System.out.printf("[CB_A-SPR] HID1=0x%016X PC=0x%016X%n", v, pc);
+                break;
+
+            // PPE TLB configuration registers
+            case 0x3B2:
+            case 0x3B3:
+            case 0x3B4:
+            case 0x3B5:
+                sprOther[spr] = v;
+
+                switch (spr) {
+                    case 0x3B3:
+                        tlbSPR3B3 = v;
+                        break;
+                    case 0x3B4:
+                        tlbSPR3B4 = v;
+                        break;
+                    case 0x3B5:
+                        tlbSPR3B5 = v;
+                        break;
+                }
+
+                sprLog("PPE-TLB", spr, v);
+                System.out.printf("[CB_A-SPR] SPR[%03X]=0x%016X PC=0x%016X%n", spr, v, pc);
+                break;
+
+            default:
+                sprLog("mtspr", spr, v);
+
+                if (spr >= 0 && spr < sprOther.length) {
+                    sprOther[spr] = v;
+                }
+                break;
+        }
+    }
+
+    /**
+     * kind: 0 = bc, 1 = bclr, 2 = bcctr
+     */
+    private void branchConditional(int insn, int kind) {
+        int bo = (insn >>> 21) & 31, bi = (insn >>> 16) & 31;
+        if ((bo & 4) == 0) {
+            ctr--;
+        }
+        boolean ctrZero = sf() ? ctr == 0 : (int) ctr == 0;
+        boolean ctrOk = (bo & 4) != 0 || (!ctrZero ^ ((bo & 2) != 0));
+        boolean condOk = (bo & 16) != 0 || (crBit(bi) == ((bo & 8) != 0 ? 1 : 0));
+        long target;
+
+        if (kind == 0) {
+            long d = (short) (insn & 0xFFFC);
+            target = (insn & 2) != 0 ? d : pc + d;
+        } else if (kind == 1) {
+            target = lr & ~3L;
+        } else {
+            target = ctr & ~3L;
+        }
+        if ((insn & 1) != 0) {
+            lr = addressWidth(pc + 4);
+        }
+        if (kind == 0 && pc == 0x100359CL) {
+            System.out.printf(
+                    "[BC-TRACE] PC=%016X BO=%02d BI=%02d CR=%08X CRBIT=%d CTR=%016X ctrOk=%b condOk=%b TARGET=%016X%n",
+                    pc, bo, bi, cr, crBit(bi), ctr, ctrOk, condOk, target
+            );
+        }
+        if (ctrOk && condOk) {
+            nextPc = addressWidth(target);
+        }
+    }
+
+    /**
+     * Entrada unificada para fallos de traducciÃ³n/almacenamiento. DSISR bit 25
+     * identifica una operaciÃ³n de escritura; DAR conserva la EA. La excepciÃ³n
+     * se entrega por la misma ruta que el resto de excepciones PPC.
+     */
+    public void raiseStorageException(boolean instruction, long effectiveAddress, boolean write) {
+        if (instruction) {
+            takeException(ExceptionHandler.EXCEPTION_INSTRUCTION_STORAGE, pc, 0x40000000L);
+            return;
+        }
+        dar = effectiveAddress;
+        dsisr = write ? 0x02000000L : 0L;
+        takeException(ExceptionHandler.EXCEPTION_DATA_STORAGE, pc, 0L);
+    }
+
+    /**
+     * Entrada de excepciÃ³n PowerPC. savedPc = valor para SRR0.
+     */
+    private void takeException(int vector, long savedPc, long extra) {
+        if (vector == ExceptionHandler.EXCEPTION_DECREMENTER && bus.readWord(vector) == 0) {
+            // Ignorar interrupción del temporizador si el guest no instaló un manejador para evitar detener la simulación.
+            return;
+        }
+        srr0 = savedPc;
+        srr1 = (msr & ~0xFFFFL) | (msr & 0xFFFFL) | extra;
+        msr &= ~(long) (MSR_EE | MSR_PR | MSR_FP | MSR_IR | MSR_DR);
+        interruptMode = true;
+        nextPc = addressWidth(vector);
+        if (bus.readWord(vector) == 0) {
+            System.err.println("[CPU] Excepción 0x" + Integer.toHexString(vector) + " en PC=0x"
+                    + Long.toHexString(savedPc) + " sin manejador instalado: CPU detenida"
+                    + (lastIllegalInsn != 0 ? String.format(" (insn 0x%08x)", lastIllegalInsn) : ""));
+            halted = true;
+        }
+    }
+
+    private void illegal(int insn) {
+        System.err.println(String.format("[CPU] InstrucciÃ³n ilegal/no implementada 0x%08x en PC=0x%x",
+                insn, pc));
+        lastIllegalInsn = insn & M32;
+        takeException(ExceptionHandler.EXCEPTION_PROGRAM, pc, 0x00080000L);
+    }
+
+    private static double sd(double v) { // redondeo a precisiÃ³n simple
+        return (double) (float) v;
+    }
+
+    public void execute(int insn, DecodingInstr.InstructionFields fields) {
+        final int op = insn >>> 26;
+        final int rd = (insn >>> 21) & 31, ra = (insn >>> 16) & 31, rb = (insn >>> 11) & 31;
+        final long simm = (short) insn;
+        final long uimm = insn & 0xFFFFL;
+        final boolean rc = (insn & 1) != 0;
+        nextPc = addressWidth(pc + 4);
+        if (debugMode) {
+            System.out.printf("PC=%08x insn=%08x%n", pc, insn);
+        }
+
+        if (pc == 0x010044D4L && insn == 0x43200000) {
+
+            long remaining = ctr & 0xFFFFFFFFL;
+
+            if (remaining == 0x765EL
+                    || remaining == 0x7000L
+                    || remaining == 0x4000L
+                    || remaining == 0x1000L
+                    || remaining == 1L
+                    || remaining == 0L) {
+
+                System.out.printf(
+                        "[1BL-DELAY] PC=%016X CTR=%08X%n",
+                        pc,
+                        remaining
+                );
+
+            }
+        }
+
+        try {
+            switch (op) {
+                case 2: // tdi
+                    if (trapCond(rd, r(ra), simm)) {
+                        takeException(ExceptionHandler.EXCEPTION_PROGRAM, pc, 0x00020000L);
+                    }
+                    break;
+                case 3: // twi
+                    // Bypassed: do not throw EXCEPTION_PROGRAM to avoid halting the dashboard init
+                    break;
+                case 7: // mulli
+                    w(rd, r(ra) * simm);
+                    break;
+                case 8: // subfic: rD = SI - rA
+                    arith(rd, ~r(ra), simm, 1, true, false, false);
+                    break;
+                case 10: { // cmpli
+                    int crf = (insn >>> 23) & 7;
+                    long crBefore = cr;
+
+                    int cmp;
+                    if ((insn & 0x00200000) != 0 && sf()) {
+                        cmp = Long.compareUnsigned(r(ra), uimm);
+                    } else {
+                        cmp = Integer.compareUnsigned((int) r(ra), (int) uimm);
+                    }
+
+                    cmpCR(crf, cmp);
+
+                    if (pc == 0x1003598L) {
+                        System.out.printf(
+                                "[CMP-TRACE] PC=%016X CRF=%d RA=%016X UIMM=%d CMP=%d CR_BEFORE=%08X CR_AFTER=%08X CR26=%d%n",
+                                pc, crf, r(ra), uimm, cmp,
+                                crBefore, cr, crBit(26)
+                        );
+                    }
+                    break;
+                }
+                /*case 10: { // cmpli
+                    if (pc == 0x1003598L) {
+                        System.out.printf(
+                                "[CMP-TRACE] PC=%016X RA=%016X UIMM=%d CR=%08X CR26=%d%n",
+                                pc, r(ra), uimm, cr, crBit(26)
+                        );
+                    }
+                    int crf = (insn >>> 23) & 7;
+                    if ((insn & 0x00200000) != 0 && sf()) {
+                        cmpCR(crf, Long.compareUnsigned(r(ra), uimm));
+                    } else {
+                        cmpCR(crf, Integer.compareUnsigned((int) r(ra), (int) uimm));
+                    }
+                    break;
+                }*/
+                case 11: { // cmpi
+                    int crf = (insn >>> 23) & 7;
+                    if ((insn & 0x00200000) != 0 && sf()) {
+                        cmpCR(crf, Long.compare(r(ra), simm));
+                    } else {
+                        cmpCR(crf, Integer.compare((int) r(ra), (int) simm));
+                    }
+                    break;
+                }
+                case 12: // addic
+                case 13: // addic.
+                    arith(rd, r(ra), simm, 0, true, false, op == 13);
+                    break;
+                case 14: // addi / li
+                    w(rd, ra0(ra) + simm);
+                    break;
+                case 15: // addis / lis
+                    w(rd, ra0(ra) + (simm << 16));
+                    break;
+                case 16: // bc
+                    branchConditional(insn, 0);
+                    break;
+                case 17: { // sc
+                    SystemCallHandler handler = systemCallHandler;
+                    if (handler == null) {
+                        takeException(ExceptionHandler.EXCEPTION_SYSTEM_CALL, pc + 4, 0);
+                    } else {
+                        int serviceNumber = (int) (gpr[0] & M32);
+                        long returnAddress = lr;
+                        long result = handler.invoke(this, serviceNumber);
+                        w(3, result & M32);
+                        // Los import thunks son llamadas de funciÃ³n: sc debe
+                        // volver al LR establecido por bl/bctrl, no a pc+4.
+                        nextPc = addressWidth(returnAddress);
+                    }
+                    break;
+                }
+                case 18: { // b
+                    long li = ((insn & 0x03FFFFFC) << 6) >> 6;
+                    long target = (insn & 2) != 0 ? li : pc + li;
+                    if ((insn & 1) != 0) {
+                        lr = addressWidth(pc + 4);
+                    }
+                    nextPc = addressWidth(target);
+                    break;
+                }
+                case 19: {
+                    int xo = (insn >>> 1) & 0x3FF;
+                    switch (xo) {
+                        case 16:
+                            branchConditional(insn, 1);
+                            break;   // bclr
+                        case 528:
+                            branchConditional(insn, 2);
+                            break;  // bcctr
+                        case 50: // rfi
+                        case 18: // rfid
+                        {
+                            int xxo = (insn >>> 1) & 0x3FF;
+                            long savedSRR0 = srr0;
+                            long savedSRR1 = srr1;
+
+                            // Suprimido para reducir output verbose
+                            // System.out.printf("[RETURN-TRACE] PC=%016X XO=%d SRR0=%016X SRR1=%016X MSR_OLD=%016X%n", pc, xxo, savedSRR0, savedSRR1, msr);
+                            // Restaurar primero el estado del procesador.
+                            msr = savedSRR1;
+                            msrValue = msr;
+
+                            interruptMode = false;
+
+                            // Calcular la direcciÃ³n con el estado restaurado.
+                            nextPc = addressWidth(savedSRR0 & ~3L);
+
+                            // Suprimido: System.out.printf("[RETURN-RESTORE] PC=%016X NEXT=%016X MSR=%016X SF=%b%n", pc, nextPc, msr, sf());
+                            break;
+                        }
+                        case 150:
+                            break; // isync
+                        case 0: { // mcrf
+                            int src = (int) getCrField((insn >>> 18) & 7);
+                            crSetField((insn >>> 23) & 7, src);
+                            break;
+                        }
+                        case 257:
+                            crSetBit(rd, crBit(ra) & crBit(rb));
+                            break;        // crand
+                        case 129:
+                            crSetBit(rd, crBit(ra) & ~crBit(rb));
+                            break;       // crandc
+                        case 289:
+                            crSetBit(rd, ~(crBit(ra) ^ crBit(rb)));
+                            break;     // creqv
+                        case 225:
+                            crSetBit(rd, ~(crBit(ra) & crBit(rb)));
+                            break;     // crnand
+                        case 33:
+                            crSetBit(rd, ~(crBit(ra) | crBit(rb)));
+                            break;      // crnor
+                        case 449:
+                            crSetBit(rd, crBit(ra) | crBit(rb));
+                            break;        // cror
+                        case 417:
+                            crSetBit(rd, crBit(ra) | ~crBit(rb));
+                            break;       // crorc
+                        case 193:
+                            crSetBit(rd, crBit(ra) ^ crBit(rb));
+                            break;        // crxor
+                        default:
+                            illegal(insn);
+                    }
+                    break;
+                }
+                case 20: { // rlwimi
+                    long m = mask64(((insn >>> 6) & 31) + 32, ((insn >>> 1) & 31) + 32);
+                    int rot = Integer.rotateLeft((int) r(rd), rb);
+                    long rr = (rot & M32) | ((long) rot << 32);
+                    long v = (rr & m) | (r(ra) & ~m);
+                    w(ra, v);
+                    if (rc) {
+                        cr0(v);
+                    }
+                    break;
+                }
+                case 21: { // rlwinm
+                    long m = mask64(((insn >>> 6) & 31) + 32, ((insn >>> 1) & 31) + 32);
+                    int rot = Integer.rotateLeft((int) r(rd), rb);
+                    long v = ((rot & M32) | ((long) rot << 32)) & m;
+                    w(ra, v);
+                    if (rc) {
+                        cr0(v);
+                    }
+                    break;
+                }
+                case 23: { // rlwnm
+                    long m = mask64(((insn >>> 6) & 31) + 32, ((insn >>> 1) & 31) + 32);
+                    int rot = Integer.rotateLeft((int) r(rd), (int) (r(rb) & 31));
+                    long v = ((rot & M32) | ((long) rot << 32)) & m;
+                    w(ra, v);
+                    if (rc) {
+                        cr0(v);
+                    }
+                    break;
+                }
+                case 24:
+                    w(ra, r(rd) | uimm);
+                    break;                  // ori
+                case 25:
+                    w(ra, r(rd) | (uimm << 16));
+                    break;          // oris
+                case 26:
+                    w(ra, r(rd) ^ uimm);
+                    break;                  // xori
+                case 27:
+                    w(ra, r(rd) ^ (uimm << 16));
+                    break;          // xoris
+                case 28: {
+                    long v = r(rd) & uimm;
+                    w(ra, v);
+                    cr0(v);
+                    break;
+                }           // andi.
+                case 29: {
+                    long v = r(rd) & (uimm << 16);
+                    w(ra, v);
+                    cr0(v);
+                    break;
+                }   // andis.
+                case 30:
+                    execRotate64(insn, rd, ra, rb, rc);
+                    break;
+                case 31:
+                    execOp31(insn, rd, ra, rb, rc);
+                    break;
+                case 32:
+                    doLoad(4, false, rd, ea(ra, simm));
+                    break;                    // lwz
+                case 33: {
+                    long e = ea(ra, simm);
+                    doLoad(4, false, rd, e);
+                    w(ra, e);
+                    break;
+                } // lwzu
+                case 34:
+                    doLoad(1, false, rd, ea(ra, simm));
+                    break;                    // lbz
+                case 35: {
+                    long e = ea(ra, simm);
+                    doLoad(1, false, rd, e);
+                    w(ra, e);
+                    break;
+                }
+                case 36:
+                    doStore(4, r(rd), ea(ra, simm));
+                    break;                       // stw
+                case 37: {
+                    long e = ea(ra, simm);
+                    doStore(4, r(rd), e);
+                    w(ra, e);
+                    break;
+                }
+                case 38:
+                    doStore(1, r(rd), ea(ra, simm));
+                    break;                       // stb
+                case 39: {
+                    long e = ea(ra, simm);
+                    doStore(1, r(rd), e);
+                    w(ra, e);
+                    break;
+                }
+                case 40:
+                    doLoad(2, false, rd, ea(ra, simm));
+                    break;                    // lhz
+                case 41: {
+                    long e = ea(ra, simm);
+                    doLoad(2, false, rd, e);
+                    w(ra, e);
+                    break;
+                }
+                case 42:
+                    doLoad(2, true, rd, ea(ra, simm));
+                    break;                     // lha
+                case 43: {
+                    long e = ea(ra, simm);
+                    doLoad(2, true, rd, e);
+                    w(ra, e);
+                    break;
+                }
+                case 44:
+                    doStore(2, r(rd), ea(ra, simm));
+                    break;                       // sth
+                case 45: {
+                    long e = ea(ra, simm);
+                    doStore(2, r(rd), e);
+                    w(ra, e);
+                    break;
+                }
+                case 46: { // lmw
+                    long e = ea(ra, simm);
+                    for (int i = rd; i < 32; i++, e += 4) {
+                        doLoad(4, false, i, e);
+                    }
+                    break;
+                }
+                case 47: { // stmw
+                    long e = ea(ra, simm);
+                    for (int i = rd; i < 32; i++, e += 4) {
+                        doStore(4, r(i), e);
+                    }
+                    break;
+                }
+                case 48:
+                    fpr[rd] = (double) Float.intBitsToFloat((int) readMemoryWord(ea(ra, simm)));
+                    break; // lfs
+                case 49: {
+                    long e = ea(ra, simm);
+                    fpr[rd] = (double) Float.intBitsToFloat((int) readMemoryWord(e));
+                    w(ra, e);
+                    break;
+                }
+                case 50:
+                    fpr[rd] = Double.longBitsToDouble(readMemoryDouble(ea(ra, simm)));
+                    break;          // lfd
+                case 51: {
+                    long e = ea(ra, simm);
+                    fpr[rd] = Double.longBitsToDouble(readMemoryDouble(e));
+                    w(ra, e);
+                    break;
+                }
+                case 52:
+                    writeMemoryWord(ea(ra, simm), Float.floatToRawIntBits((float) fpr[rd]) & M32);
+                    break; // stfs
+                case 53: {
+                    long e = ea(ra, simm);
+                    writeMemoryWord(e, Float.floatToRawIntBits((float) fpr[rd]) & M32);
+                    w(ra, e);
+                    break;
+                }
+                case 54:
+                    writeMemoryDouble(ea(ra, simm), Double.doubleToRawLongBits(fpr[rd]));
+                    break;       // stfd
+                case 55: {
+                    long e = ea(ra, simm);
+                    writeMemoryDouble(e, Double.doubleToRawLongBits(fpr[rd]));
+                    w(ra, e);
+                    break;
+                }
+                case 58: { // ld / ldu / lwa (DS-form)
+                    long d = (short) (insn & 0xFFFC);
+                    long e = ea(ra, d);
+                    switch (insn & 3) {
+                        case 0:
+                            doLoad(8, false, rd, e);
+                            break;
+                        case 1:
+                            doLoad(8, false, rd, e);
+                            w(ra, e);
+                            break;
+                        case 2:
+                            doLoad(4, true, rd, e);
+                            break;
+                        default:
+                            illegal(insn);
+                    }
+                    break;
+                }
+                case 62: { // std / stdu
+                    long d = (short) (insn & 0xFFFC);
+                    long e = ea(ra, d);
+                    switch (insn & 3) {
+                        case 0:
+                            doStore(8, r(rd), e);
+                            break;
+                        case 1:
+                            doStore(8, r(rd), e);
+                            w(ra, e);
+                            break;
+                        default:
+                            illegal(insn);
+                    }
+                    break;
+                }
+                case 59:
+                    execFP(insn, true);
+                    break;
+                case 63:
+                    execFP(insn, false);
+                    break;
+                case 4: // AltiVec
+                    if (!execAltivec(insn)) {
+                        illegal(insn);
+                    }
+                    break;
+                case 5:
+                case 6: // VMX128 load/store del Xenon (lvx128 / stvx128 / lvlx128 / lvrx128 / stvlx128 / stvrx128)
+                    if (!execVmx128Mem(op, insn)) {
+                        illegal(insn);
+                    }
+                    break;
+                default:
+                    illegal(insn);
+            }
+        } catch (MMU.TranslationFault fault) {
+            // La MMU ya entregÃ³ DSI/ISI y fijÃ³ DAR/DSISR. No ejecutar acceso fÃ­sico ni
+            // convertir el fallo de almacenamiento en una excepciÃ³n de programa.
+        } catch (RuntimeException e) {
+            System.err.println("[CPU] Error ejecutando 0x" + Integer.toHexString(insn) + " en PC=0x"
+                    + Long.toHexString(pc) + ": " + e);
+            lastIllegalInsn = insn & M32;
+            takeException(ExceptionHandler.EXCEPTION_PROGRAM, pc, 0x00080000L);
+        }
+        traceBootAnimationCall(insn, op);
+        if (nextPc != addressWidth(pc + 4)) {
+            /*System.out.printf(
+                    "[PC-CHANGE] OLD=%016X NEXT=%016X INS=%08X OP=%02X LR=%016X CTR=%016X%n",
+                    pc, nextPc, insn, op, lr, ctr
+            );*/
+        }
+        pc = addressWidth(nextPc);
+        instructionCount++;
+    }
+
+    // ------------------------------------------------------------------
+    // AltiVec / VMX (opcode 4 y cargas/almacenes del opcode 31).
+    // 32 registros de 128 bits; vreg[4*n + k] = palabra k (0 = la mÃ¡s significativa, big-endian).
+    // VMX128 (Xenon, opcodes 5/6 y variantes de 128 registros) NO estÃ¡ implementado.
+    // ------------------------------------------------------------------
+    private final int[] vreg = new int[512]; // 128 vector registers x 4 words (VMX128)
+
+    public int[] getVectorRegs128() {
+        return vreg;
+    }
+
+    private byte[] vbytes(int r) {
+        byte[] b = new byte[16];
+        for (int k = 0; k < 4; k++) {
+            int w = vreg[4 * r + k];
+            b[4 * k] = (byte) (w >>> 24);
+            b[4 * k + 1] = (byte) (w >>> 16);
+            b[4 * k + 2] = (byte) (w >>> 8);
+            b[4 * k + 3] = (byte) w;
+        }
+        return b;
+    }
+
+    private void vsetBytes(int r, byte[] b) {
+        for (int k = 0; k < 4; k++) {
+            vreg[4 * r + k] = ((b[4 * k] & 0xFF) << 24) | ((b[4 * k + 1] & 0xFF) << 16)
+                    | ((b[4 * k + 2] & 0xFF) << 8) | (b[4 * k + 3] & 0xFF);
+        }
+    }
+
+    private float vf(int r, int k) {
+        return Float.intBitsToFloat(vreg[4 * r + k]);
+    }
+
+    private void vsetf(int r, int k, float v) {
+        vreg[4 * r + k] = Float.floatToRawIntBits(v);
+    }
+
+    /**
+     * Cargas/almacenes vectoriales del opcode 31. Devuelve false si no es una
+     * de ellas.
+     */
+    private boolean execVectorMem(int key, int rd, int ra, int rb) {
+        long e = eaX(ra, rb);
+        switch (key) {
+            case 103:
+            case 359: { // lvx / lvxl
+                long a = e & ~15L;
+                byte[] b = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    b[i] = readMemoryByte(a + i);
+                }
+                vsetBytes(rd, b);
+                return true;
+            }
+            case 231:
+            case 487: { // stvx / stvxl
+                long a = e & ~15L;
+                byte[] b = vbytes(rd);
+                for (int i = 0; i < 16; i++) {
+                    writeMemoryByte(a + i, b[i]);
+                }
+                return true;
+            }
+            case 6:
+            case 38: { // lvsl / lvsr
+                int sh = (int) (e & 15);
+                byte[] b = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    b[i] = (byte) (key == 6 ? sh + i : 16 - sh + i);
+                }
+                vsetBytes(rd, b);
+                return true;
+            }
+            case 71: { // lvewx
+                int k = (int) ((e & 15) >> 2);
+                vreg[4 * rd + k] = (int) readMemoryWord(e & ~3L);
+                return true;
+            }
+            case 199: { // stvewx
+                int k = (int) ((e & 15) >> 2);
+                writeMemoryWord(e & ~3L, vreg[4 * rd + k] & M32);
+                return true;
+            }
+            case 519:
+            case 775: { // lvlx / lvlxl (Xenon): bytes desde EA hasta el final del bloque, a la izquierda
+                int n = 16 - (int) (e & 15);
+                byte[] b = new byte[16];
+                for (int i = 0; i < n; i++) {
+                    b[i] = readMemoryByte(e + i);
+                }
+                vsetBytes(rd, b);
+                return true;
+            }
+            case 551:
+            case 807: { // lvrx / lvrxl: bytes anteriores a EA en el bloque, a la derecha
+                int n = (int) (e & 15);
+                byte[] b = new byte[16];
+                for (int i = 0; i < n; i++) {
+                    b[16 - n + i] = readMemoryByte((e & ~15L) + i);
+                }
+                vsetBytes(rd, b);
+                return true;
+            }
+            case 647:
+            case 903: { // stvlx / stvlxl
+                int n = 16 - (int) (e & 15);
+                byte[] b = vbytes(rd);
+                for (int i = 0; i < n; i++) {
+                    writeMemoryByte(e + i, b[i]);
+                }
+                return true;
+            }
+            case 679:
+            case 935: { // stvrx / stvrxl
+                int n = (int) (e & 15);
+                byte[] b = vbytes(rd);
+                for (int i = 0; i < n; i++) {
+                    writeMemoryByte((e & ~15L) + i, b[16 - n + i]);
+                }
+                return true;
+            }
+            case 342:
+            case 374:
+            case 822:
+            case 566 + 1000: // dst/dstt/dss: sin efecto
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * VMX128 memory load/store (opcodes 5 and 6 on Xenon, 128 registers).
+     */
+    private boolean execVmx128Mem(int op, int insn) {
+        int vd = ((insn >>> 21) & 0x1F) | ((insn & 0x3) << 5);
+        int ra = (insn >>> 16) & 0x1F;
+        int rb = (insn >>> 11) & 0x1F;
+        int sub = (insn >>> 2) & 0x1FF;
+        long e = eaX(ra, rb);
+        int reg = vd & 127;
+        boolean isStore = (op == 6) && ((sub & 0x100) != 0 || (insn & 0x400) != 0);
+        if (isStore) {
+            long a = e & ~15L;
+            byte[] b = vbytes(reg);
+            for (int i = 0; i < 16; i++) {
+                writeMemoryByte(a + i, b[i]);
+            }
+        } else {
+            long a = e & ~15L;
+            byte[] b = new byte[16];
+            for (int i = 0; i < 16; i++) {
+                b[i] = readMemoryByte(a + i);
+            }
+            vsetBytes(reg, b);
+        }
+        return true;
+    }
+
+    /**
+     * Xenon VMX128 (128-register) instruction decoder under opcode 4.
+     */
+    private boolean execVmx128Op4(int insn) {
+        int vdLo = (insn >>> 21) & 0x1F;
+        int vaLo = (insn >>> 16) & 0x1F;
+        int vbLo = (insn >>> 11) & 0x1F;
+        int low4 = insn & 0xF;
+
+        // VA128 format: vperm128 (low4 == 3)
+        if (low4 == 3) {
+            int vd = vdLo | (((insn >>> 9) & 0x3) << 5);
+            int va  = vaLo | (((insn >>> 5) & 0x1) << 5);
+            int vb = vbLo | (((insn >>> 4) & 0x1) << 5);
+            int vc = (insn >>> 6) & 0x7;
+            byte[] a = vbytes(va), b = vbytes(vb), c = vbytes(vc), o = new byte[16];
+            for (int i = 0; i < 16; i++) {
+                int idx = c[i] & 31;
+                o[i] = idx < 16 ? a[idx] : b[idx - 16];
+            }
+            vsetBytes(vd, o);
+            return true;
+        }
+
+        // VX128 format: vd_hi in bits 30..31, va_hi in bit 28, vb_hi in bit 29, xo7 in bits 21..27
+        int vd = vdLo | ((insn & 0x3) << 5);
+        int va  = vaLo | (((insn >>> 3) & 0x1) << 5);
+        int vb = vbLo | (((insn >>> 2) & 0x1) << 5);
+        int xo7 = (insn >>> 4) & 0x7F;
+
+        switch (xo7) {
+            case 0x00: // vaddfp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, vf(va, k) + vf(vb, k));
+                }
+                return true;
+            case 0x04: // vsubfp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, vf(va, k) - vf(vb, k));
+                }
+                return true;
+            case 0x08: // vmulfp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, vf(va, k) * vf(vb, k));
+                }
+                return true;
+            case 0x0C: // vmaddfp128: vD = vA * vB + vD
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, Math.fma(vf(va, k), vf(vb, k), vf(vd, k)));
+                }
+                return true;
+            case 0x10: // vmaddcfp128: vD = vA * vD + vB
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, Math.fma(vf(va, k), vf(vd, k), vf(vb, k)));
+                }
+                return true;
+            case 0x14: // vnmsubfp128: vD = -(vA * vB - vD)
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, -Math.fma(vf(va, k), vf(vb, k), -vf(vd, k)));
+                }
+                return true;
+            case 0x18: { // vmsum3fp128
+                float dot = vf(va, 0) * vf(vb, 0) + vf(va, 1) * vf(vb, 1) + vf(va, 2) * vf(vb, 2);
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, dot);
+                }
+                return true;
+            }
+            case 0x1C: { // vmsum4fp128
+                float dot = vf(va, 0) * vf(vb, 0) + vf(va, 1) * vf(vb, 1)
+                        + vf(va, 2) * vf(vb, 2) + vf(va, 3) * vf(vb, 3);
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, dot);
+                }
+                return true;
+            }
+            case 0x24: // vand128
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = vreg[4 * va  + k] & vreg[4 * vb + k];
+                }
+                return true;
+            case 0x2C: // vandc128
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = vreg[4 * va  + k] & ~vreg[4 * vb + k];
+                }
+                return true;
+            case 0x34: // vnor128
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = ~(vreg[4 * va  + k] | vreg[4 * vb + k]);
+                }
+                return true;
+            case 0x3C: // vor128
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = vreg[4 * va  + k] | vreg[4 * vb + k];
+                }
+                return true;
+            case 0x44: // vxor128
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = vreg[4 * va  + k] ^ vreg[4 * vb + k];
+                }
+                return true;
+            case 0x4C: // vsel128
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = (vreg[4 * va  + k] & ~vreg[4 * vd + k]) | (vreg[4 * vb + k] & vreg[4 * vd + k]);
+                }
+                return true;
+            case 0x54:
+            case 0x5C: { // vslo128 / vsro128
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                int octets = (b[15] >>> 3) & 0xF;
+                if (xo7 == 0x54) {
+                    for (int i = 0; i + octets < 16; i++) {
+                        o[i] = a[i + octets];
+                    }
+                } else {
+                    for (int i = octets; i < 16; i++) {
+                        o[i] = a[i - octets];
+                    }
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 0x2A: // vmaxfp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, Math.max(vf(va, k), vf(vb, k)));
+                }
+                return true;
+            case 0x2E: // vminfp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, Math.min(vf(va, k), vf(vb, k)));
+                }
+                return true;
+            case 0x32:
+            case 0x36: { // vmrghw128 / vmrglw128
+                int base = xo7 == 0x36 ? 2 : 0;
+                int a0 = vreg[4 * va  + base], a1 = vreg[4 * va  + base + 1];
+                int b0 = vreg[4 * vb + base], b1 = vreg[4 * vb + base + 1];
+                vreg[4 * vd] = a0;
+                vreg[4 * vd + 1] = b0;
+                vreg[4 * vd + 2] = a1;
+                vreg[4 * vd + 3] = b1;
+                return true;
+            }
+            case 0x62:
+            case 0x66:
+            case 0x6A: { // vspltb128 / vsplth128 / vspltw128
+                int size = xo7 == 0x62 ? 1 : (xo7 == 0x66 ? 2 : 4);
+                int idx = vaLo & (16 / size - 1);
+                byte[] b = vbytes(vb), o = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    o[i] = b[idx * size + (i % size)];
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 0x6E:
+            case 0x72:
+            case 0x76: { // vspltisb128 / vspltish128 / vspltisw128
+                int simm = (vaLo << 27) >> 27;
+                int size = xo7 == 0x6E ? 1 : (xo7 == 0x72 ? 2 : 4);
+                byte[] o = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    int sh = 8 * (size - 1 - (i % size));
+                    o[i] = (byte) (sh >= 32 ? (simm >> 31) : (simm >> sh));
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 0x7A: { // vsldoi128
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                int sh = (insn >>> 6) & 15;
+                for (int i = 0; i < 16; i++) {
+                    int idx = sh + i;
+                    o[i] = idx < 16 ? a[idx] : b[idx - 16];
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 0x02:
+            case 0x06:
+            case 0x0A:
+            case 0x0E:
+            case 0x12:
+            case 0x16:
+            case 0x1A:
+            case 0x1E: { // vcmpeqfp128 / vcmpgefp128 / vcmpgtfp128 / vcmpbfp128
+                int kind = xo7 >>> 3;
+                boolean all = true, none = true;
+                for (int k = 0; k < 4; k++) {
+                    float fa = vf(va, k), fb = vf(vb, k);
+                    boolean cond = kind == 0 ? (fa == fb)
+                            : kind == 1 ? (fa >= fb)
+                                    : kind == 2 ? (fa > fb)
+                                            : (Math.abs(fa) <= Math.abs(fb));
+                    vreg[4 * vd + k] = cond ? 0xFFFFFFFF : 0;
+                    all &= cond;
+                    none &= !cond;
+                }
+                if ((xo7 & 0x4) != 0) {
+                    crSetField(6, (all ? 8 : 0) | (none ? 2 : 0));
+                }
+                return true;
+            }
+            case 0x22:
+            case 0x26: { // vcmpequw128
+                boolean all = true, none = true;
+                for (int k = 0; k < 4; k++) {
+                    boolean eq = vreg[4 * va  + k] == vreg[4 * vb + k];
+                    vreg[4 * vd + k] = eq ? 0xFFFFFFFF : 0;
+                    all &= eq;
+                    none &= !eq;
+                }
+                if ((xo7 & 0x4) != 0) {
+                    crSetField(6, (all ? 8 : 0) | (none ? 2 : 0));
+                }
+                return true;
+            }
+            case 0x64:
+            case 0x68: { // vcfpsxws128 / vcfpuxws128
+                int scale = 1 << (vaLo & 31);
+                for (int k = 0; k < 4; k++) {
+                    float val = vf(vb, k) * scale;
+                    if (xo7 == 0x64) {
+                        vreg[4 * vd + k] = val >= Integer.MAX_VALUE ? Integer.MAX_VALUE
+                                : val <= Integer.MIN_VALUE ? Integer.MIN_VALUE : (int) val;
+                    } else {
+                        long u = val <= 0 ? 0L : val >= 0xFFFFFFFFL ? 0xFFFFFFFFL : (long) val;
+                        vreg[4 * vd + k] = (int) u;
+                    }
+                }
+                return true;
+            }
+            case 0x6C:
+            case 0x70: { // vcsxwfp128 / vcuxwfp128
+                int scale = 1 << (vaLo & 31);
+                for (int k = 0; k < 4; k++) {
+                    int raw = vreg[4 * vb + k];
+                    float val = xo7 == 0x6C ? ((float) raw / scale) : ((float) (raw & 0xFFFFFFFFL) / scale);
+                    vsetf(vd, k, val);
+                }
+                return true;
+            }
+            case 0x74:
+            case 0x78:
+            case 0x7C:
+            case 0x5E: { // vrfim128 / vrfin128 / vrfip128 / vrfiz128
+                for (int k = 0; k < 4; k++) {
+                    float fb = vf(vb, k);
+                    float r = xo7 == 0x78 ? Math.round(fb)
+                            : xo7 == 0x5E ? (fb < 0 ? (float) Math.ceil(fb) : (float) Math.floor(fb))
+                                    : xo7 == 0x7C ? (float) Math.ceil(fb) : (float) Math.floor(fb);
+                    vsetf(vd, k, r);
+                }
+                return true;
+            }
+            case 0x4E: // vrefp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, 1.0f / vf(vb, k));
+                }
+                return true;
+            case 0x52: // vrsqrtefp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, (float) (1.0 / Math.sqrt(vf(vb, k))));
+                }
+                return true;
+            case 0x56: // vexptefp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, (float) Math.pow(2.0, vf(vb, k)));
+                }
+                return true;
+            case 0x5A: // vlogefp128
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, (float) (Math.log(vf(vb, k)) / Math.log(2.0)));
+                }
+                return true;
+            case 0x20:
+            case 0x28:
+            case 0x30:
+            case 0x38:
+            case 0x40:
+            case 0x48:
+            case 0x50:
+            case 0x58:
+            case 0x3A:
+            case 0x3E:
+            case 0x42:
+            case 0x46:
+            case 0x4A: // vpk*128 / vupk*128
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = 0;
+                }
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Opcode 4 (AltiVec). Devuelve false si la instrucciÃ³n no estÃ¡
+     * implementada.
+     */
+    private boolean execAltivec(int insn) {
+        final int vd = (insn >>> 21) & 31, va  = (insn >>> 16) & 31, vb = (insn >>> 11) & 31, vc = (insn >>> 6) & 31;
+        final int va6 = insn & 0x3F;
+        switch (va6) { // formato VA
+            case 43: { // vperm
+                byte[] a = vbytes(va), b = vbytes(vb), c = vbytes(vc), o = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    int idx = c[i] & 31;
+                    o[i] = idx < 16 ? a[idx] : b[idx - 16];
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 42: // vsel
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = (vreg[4 * va  + k] & ~vreg[4 * vc + k]) | (vreg[4 * vb + k] & vreg[4 * vc + k]);
+                }
+                return true;
+            case 44: { // vsldoi
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                int sh = (insn >>> 6) & 15;
+                for (int i = 0; i < 16; i++) {
+                    int idx = sh + i;
+                    o[i] = idx < 16 ? a[idx] : b[idx - 16];
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 46: // vmaddfp vD = vA*vC + vB
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, Math.fma(vf(va, k), vf(vc, k), vf(vb, k)));
+                }
+                return true;
+            case 47: // vnmsubfp vD = -(vA*vC - vB) or vupkd3d128
+                if (((insn >>> 9) & 3) != 0) {
+                    // vupkd3d128: unpack 4 components into float vector
+                    for (int k = 0; k < 4; k++) {
+                        vsetf(vd, k, 0.0f);
+                    }
+                    return true;
+                }
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, -Math.fma(vf(va, k), vf(vc, k), -vf(vb, k)));
+                }
+                return true;
+            case 7: { // vrlimi128 vD, vA, imm, rot (Xenon VMX128)
+                int mask = (insn >>> 11) & 0xF;
+                int rot = (insn >>> 6) & 3;
+                int[] src = new int[]{vreg[4 * va], vreg[4 * va  + 1], vreg[4 * va  + 2], vreg[4 * va  + 3]};
+                for (int k = 0; k < 4; k++) {
+                    if (((mask >>> (3 - k)) & 1) != 0) {
+                        vreg[4 * vd + k] = src[(k + rot) & 3];
+                    }
+                }
+                return true;
+            }
+            case 15: { // vpermwi128 vD, vB, imm (Xenon VMX128)
+                int perm = ((insn >>> 16) & 0x1F) | (((insn >>> 6) & 0x7) << 5);
+                int[] src = new int[]{vreg[4 * vb], vreg[4 * vb + 1], vreg[4 * vb + 2], vreg[4 * vb + 3]};
+                for (int k = 0; k < 4; k++) {
+                    int sel = (perm >>> (6 - 2 * k)) & 3;
+                    vreg[4 * vd + k] = src[sel];
+                }
+                return true;
+            }
+            case 39: { // vpkd3d128 (Xenon VMX128)
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = 0;
+                }
+                return true;
+            }
+            default:
+                break;
+        }
+        int xo = insn & 0x7FF;
+        switch (xo) {
+            case 0:
+            case 64:
+            case 128:
+            case 1024:
+            case 1088:
+            case 1152: { // vaddu?m / vsubu?m
+                boolean sub = xo >= 1024;
+                int size = (xo & 0x3FF) == 0 ? 1 : ((xo & 0x3FF) == 64 ? 2 : 4);
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                for (int i = 0; i < 16; i += size) {
+                    long x = 0, y = 0;
+                    for (int j = 0; j < size; j++) {
+                        x = (x << 8) | (a[i + j] & 0xFF);
+                        y = (y << 8) | (b[i + j] & 0xFF);
+                    }
+                    long r = sub ? x - y : x + y;
+                    for (int j = size - 1; j >= 0; j--) {
+                        o[i + j] = (byte) r;
+                        r >>= 8;
+                    }
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 1028:
+            case 1092:
+            case 1156:
+            case 1220:
+            case 1284: // vand vandc vor vxor vnor
+                for (int k = 0; k < 4; k++) {
+                    int x = vreg[4 * va  + k], y = vreg[4 * vb + k], r;
+                    switch (xo) {
+                        case 1028:
+                            r = x & y;
+                            break;
+                        case 1092:
+                            r = x & ~y;
+                            break;
+                        case 1156:
+                            r = x | y;
+                            break;
+                        case 1220:
+                            r = x ^ y;
+                            break;
+                        default:
+                            r = ~(x | y);
+                    }
+                    vreg[4 * vd + k] = r;
+                }
+                return true;
+            case 10:
+            case 74: // vaddfp / vsubfp
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, xo == 10 ? vf(va, k) + vf(vb, k) : vf(va, k) - vf(vb, k));
+                }
+                return true;
+            case 524:
+            case 588:
+            case 652: { // vspltb / vsplth / vspltw
+                int size = xo == 524 ? 1 : (xo == 588 ? 2 : 4);
+                int idx = va  & (16 / size - 1);
+                byte[] b = vbytes(vb), o = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    o[i] = b[idx * size + (i % size)];
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 780:
+            case 844:
+            case 908: { // vspltisb / vspltish / vspltisw
+                int simm = (va  << 27) >> 27;
+                int size = xo == 780 ? 1 : (xo == 844 ? 2 : 4);
+                byte[] o = new byte[16];
+                for (int i = 0; i < 16; i++) {
+                    int sh = 8 * (size - 1 - (i % size));
+                    o[i] = (byte) (sh >= 32 ? (simm >> 31) : (simm >> sh));
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 12:
+            case 76:
+            case 140:
+            case 268:
+            case 332:
+            case 396: { // vmrgh*/vmrgl*
+                int size = (xo & 0xFF) == 12 ? 1 : ((xo & 0xFF) == 76 ? 2 : 4);
+                boolean low = xo >= 268;
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                int base = low ? 8 : 0;
+                for (int i = 0; i < 8 / size; i++) {
+                    for (int j = 0; j < size; j++) {
+                        o[(2 * i) * size + j] = a[base + i * size + j];
+                        o[(2 * i + 1) * size + j] = b[base + i * size + j];
+                    }
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 4:
+            case 68:
+            case 132: { // vrlb / vrlh / vrlw
+                int size = xo == 4 ? 1 : (xo == 68 ? 2 : 4);
+                int bits = size * 8;
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                for (int i = 0; i < 16; i += size) {
+                    int x = 0, sh = b[i + size - 1] & (bits - 1);
+                    for (int j = 0; j < size; j++) {
+                        x = (x << 8) | (a[i + j] & 0xFF);
+                    }
+                    int r = bits == 8 ? (((x & 0xFF) << sh) | ((x & 0xFF) >>> (8 - sh)))
+                            : bits == 16 ? (((x & 0xFFFF) << sh) | ((x & 0xFFFF) >>> (16 - sh)))
+                                    : Integer.rotateLeft(x, sh);
+                    for (int j = size - 1; j >= 0; j--) {
+                        o[i + j] = (byte) r;
+                        r >>>= 8;
+                    }
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 260:
+            case 324:
+            case 388: // vslb / vslh / vslw
+            case 516:
+            case 580:
+            case 644: // vsrb / vsrh / vsrw
+            case 772:
+            case 836:
+            case 900: { // vsrab / vsrah / vsraw
+                int group = xo >>> 8; // 1=sl, 2=sr, 3=sra
+                int size = (xo & 0xFF) == 4 ? 1 : ((xo & 0xFF) == 68 ? 2 : 4);
+                int bits = size * 8;
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                for (int i = 0; i < 16; i += size) {
+                    int x = 0, sh = b[i + size - 1] & (bits - 1);
+                    for (int j = 0; j < size; j++) {
+                        x = (x << 8) | (a[i + j] & 0xFF);
+                    }
+                    int r;
+                    if (group == 1) {
+                        r = x << sh;
+                    } else if (group == 2) {
+                        int mask = bits == 32 ? -1 : ((1 << bits) - 1);
+                        r = (x & mask) >>> sh;
+                    } else {
+                        int sx = (x << (32 - bits)) >> (32 - bits);
+                        r = sx >> sh;
+                    }
+                    for (int j = size - 1; j >= 0; j--) {
+                        o[i + j] = (byte) r;
+                        r >>>= 8;
+                    }
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 1036:
+            case 1100: { // vslo / vsro (shift by octet)
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                int octets = (b[15] >>> 3) & 0xF;
+                if (xo == 1036) {
+                    for (int i = 0; i + octets < 16; i++) {
+                        o[i] = a[i + octets];
+                    }
+                } else {
+                    for (int i = octets; i < 16; i++) {
+                        o[i] = a[i - octets];
+                    }
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 512:
+            case 576:
+            case 640: // vaddubs / vadduhs / vadduws
+            case 768:
+            case 832:
+            case 896: // vaddsbs / vaddshs / vaddsws
+            case 1536:
+            case 1600:
+            case 1664: // vsububs / vsubuhs / vsubuws
+            case 1792:
+            case 1856:
+            case 1920: { // vsubsbs / vsubshs / vsubsws
+                boolean sub = xo >= 1536;
+                boolean signed = ((xo >>> 8) & 1) != 0;
+                int size = (xo & 0xFF) == 0 ? 1 : ((xo & 0xFF) == 64 ? 2 : 4);
+                int bits = size * 8;
+                byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+                for (int i = 0; i < 16; i += size) {
+                    long x = 0, y = 0;
+                    for (int j = 0; j < size; j++) {
+                        x = (x << 8) | (a[i + j] & 0xFF);
+                        y = (y << 8) | (b[i + j] & 0xFF);
+                    }
+                    long r;
+                    if (signed) {
+                        int shift = 64 - bits;
+                        x = (x << shift) >> shift;
+                        y = (y << shift) >> shift;
+                        long min = -(1L << (bits - 1));
+                        long max = (1L << (bits - 1)) - 1;
+                        r = Math.max(min, Math.min(max, sub ? (x - y) : (x + y)));
+                    } else {
+                        long max = (1L << bits) - 1;
+                        r = Math.max(0L, Math.min(max, sub ? (x - y) : (x + y)));
+                    }
+                    for (int j = size - 1; j >= 0; j--) {
+                        o[i + j] = (byte) r;
+                        r >>>= 8;
+                    }
+                }
+                vsetBytes(vd, o);
+                return true;
+            }
+            case 1034:
+            case 1098: // vmaxfp / vminfp
+                for (int k = 0; k < 4; k++) {
+                    float fa = vf(va, k), fb = vf(vb, k);
+                    vsetf(vd, k, xo == 1034 ? Math.max(fa, fb) : Math.min(fa, fb));
+                }
+                return true;
+            case 522:
+            case 586:
+            case 650:
+            case 714: // vrfin / vrfiz / vrfip / vrfim
+                for (int k = 0; k < 4; k++) {
+                    float fb = vf(vb, k);
+                    float r = xo == 522 ? Math.round(fb)
+                            : xo == 586 ? (fb < 0 ? (float) Math.ceil(fb) : (float) Math.floor(fb))
+                                    : xo == 650 ? (float) Math.ceil(fb) : (float) Math.floor(fb);
+                    vsetf(vd, k, r);
+                }
+                return true;
+            case 266: // vrefp
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, 1.0f / vf(vb, k));
+                }
+                return true;
+            case 330: // vrsqrtefp
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, (float) (1.0 / Math.sqrt(vf(vb, k))));
+                }
+                return true;
+            case 394: // vexptefp
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, (float) Math.pow(2.0, vf(vb, k)));
+                }
+                return true;
+            case 458: // vlogefp
+                for (int k = 0; k < 4; k++) {
+                    vsetf(vd, k, (float) (Math.log(vf(vb, k)) / Math.log(2.0)));
+                }
+                return true;
+            case 778:
+            case 842: { // vcfux / vcfsx
+                int scale = 1 << (va  & 31);
+                for (int k = 0; k < 4; k++) {
+                    int raw = vreg[4 * vb + k];
+                    float val = xo == 842 ? ((float) raw / scale) : ((float) (raw & 0xFFFFFFFFL) / scale);
+                    vsetf(vd, k, val);
+                }
+                return true;
+            }
+            case 906:
+            case 970: { // vctuxs / vctsxs
+                int scale = 1 << (va  & 31);
+                for (int k = 0; k < 4; k++) {
+                    float val = vf(vb, k) * scale;
+                    if (xo == 970) {
+                        vreg[4 * vd + k] = val >= Integer.MAX_VALUE ? Integer.MAX_VALUE
+                                : val <= Integer.MIN_VALUE ? Integer.MIN_VALUE : (int) val;
+                    } else {
+                        long u = val <= 0 ? 0L : val >= 0xFFFFFFFFL ? 0xFFFFFFFFL : (long) val;
+                        vreg[4 * vd + k] = (int) u;
+                    }
+                }
+                return true;
+            }
+            case 14:
+            case 78:
+            case 142:
+            case 206:
+            case 270:
+            case 334:
+            case 398:
+            case 462: // vpk*
+            case 526:
+            case 590:
+            case 654:
+            case 718: { // vupk*
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = 0;
+                }
+                return true;
+            }
+            case 1540: // mfvscr
+                for (int k = 0; k < 4; k++) {
+                    vreg[4 * vd + k] = 0;
+                }
+                return true;
+            case 1604: // mtvscr
+                return true;
+            default:
+                break;
+        }
+        int cx = xo & 0x3FF;
+        if (cx == 198 || cx == 454 || cx == 710 || cx == 966) { // vcmpeqfp, vcmpgefp, vcmpgtfp, vcmpbfp
+            boolean all = true, none = true;
+            for (int k = 0; k < 4; k++) {
+                float fa = vf(va, k), fb = vf(vb, k);
+                boolean cond = cx == 198 ? (fa == fb)
+                        : cx == 454 ? (fa >= fb)
+                                : cx == 710 ? (fa > fb)
+                                        : (Math.abs(fa) <= Math.abs(fb));
+                vreg[4 * vd + k] = cond ? 0xFFFFFFFF : 0;
+                all &= cond;
+                none &= !cond;
+            }
+            if ((xo & 0x400) != 0) {
+                crSetField(6, (all ? 8 : 0) | (none ? 2 : 0));
+            }
+            return true;
+        }
+        if (cx == 518 || cx == 582 || cx == 646 || cx == 774 || cx == 838 || cx == 902) { // vcmpgtu*/vcmpgts*
+            int size = (cx == 518 || cx == 774) ? 1 : ((cx == 582 || cx == 838) ? 2 : 4);
+            boolean signed = cx >= 774;
+            byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+            boolean all = true, none = true;
+            for (int i = 0; i < 16; i += size) {
+                long x = 0, y = 0;
+                for (int j = 0; j < size; j++) {
+                    x = (x << 8) | (a[i + j] & 0xFF);
+                    y = (y << 8) | (b[i + j] & 0xFF);
+                }
+                if (signed) {
+                    int shift = 64 - size * 8;
+                    x = (x << shift) >> shift;
+                    y = (y << shift) >> shift;
+                }
+                boolean gt = x > y;
+                for (int j = 0; j < size; j++) {
+                    o[i + j] = (byte) (gt ? 0xFF : 0);
+                }
+                all &= gt;
+                none &= !gt;
+            }
+            vsetBytes(vd, o);
+            if ((xo & 0x400) != 0) {
+                crSetField(6, (all ? 8 : 0) | (none ? 2 : 0));
+            }
+            return true;
+        }
+        // vcmpequb/h/w (+ Rc en el bit 10)
+        if (cx == 6 || cx == 70 || cx == 134) {
+            int size = cx == 6 ? 1 : (cx == 70 ? 2 : 4);
+            byte[] a = vbytes(va), b = vbytes(vb), o = new byte[16];
+            boolean all = true, none = true;
+            for (int i = 0; i < 16; i += size) {
+                boolean eq = true;
+                for (int j = 0; j < size; j++) {
+                    eq &= a[i + j] == b[i + j];
+                }
+                for (int j = 0; j < size; j++) {
+                    o[i + j] = (byte) (eq ? 0xFF : 0);
+                }
+                all &= eq;
+                none &= !eq;
+            }
+            vsetBytes(vd, o);
+            if ((xo & 0x400) != 0) {
+                crSetField(6, (all ? 8 : 0) | (none ? 2 : 0));
+            }
+            return true;
+        }
+        return execVmx128Op4(insn);
+    }
+
+    /**
+     * Opcode 30: rotaciones de 64 bits (MD y MDS).
+     */
+    private void execRotate64(int insn, int rs, int ra, int rb, boolean rc) {
+        int sh = rb | ((insn & 2) << 4);
+        int mb = ((insn >>> 6) & 0x1F) | (insn & 0x20);
+        long src = r(rs);
+        long v;
+        switch ((insn >>> 2) & 7) {
+            case 0:
+                v = Long.rotateLeft(src, sh) & mask64(mb, 63);
+                break;                    // rldicl
+            case 1:
+                v = Long.rotateLeft(src, sh) & mask64(0, mb);
+                break;                     // rldicr
+            case 2:
+                v = Long.rotateLeft(src, sh) & mask64(mb, 63 - sh);
+                break;               // rldic
+            case 3: {                                                                         // rldimi
+                long m = mask64(mb, 63 - sh);
+                v = (Long.rotateLeft(src, sh) & m) | (r(ra) & ~m);
+                break;
+            }
+            case 4: { // rldcl / rldcr
+                int n = (int) (r(rb) & 63);
+                if (((insn >>> 1) & 1) == 0) {
+                    v = Long.rotateLeft(src, n) & mask64(mb, 63);
+                } else {
+                    v = Long.rotateLeft(src, n) & mask64(0, mb);
+                }
+                break;
+            }
+            default:
+                illegal(insn);
+                return;
+        }
+        w(ra, v);
+        if (rc) {
+            cr0(v);
+        }
+    }
+
+    private void execOp31(int insn, int rd, int ra, int rb, boolean rc) {
+        int xo = (insn >>> 1) & 0x3FF;
+        int key = xo;
+        boolean oe = false;
+        if ((xo & 0x200) != 0 && isXOArith(xo & 0x1FF)) {
+            key = xo & 0x1FF;
+            oe = true;
+        }
+        long a = r(ra), b = r(rb), s = r(rd);
+        switch (key) {
+            case 0: // cmp
+                if ((insn & 0x00200000) != 0 && sf()) {
+                    cmpCR((insn >>> 23) & 7, Long.compare(a, b));
+                } else {
+                    cmpCR((insn >>> 23) & 7, Integer.compare((int) a, (int) b));
+                }
+                break;
+            case 32: // cmpl
+                if ((insn & 0x00200000) != 0 && sf()) {
+                    cmpCR((insn >>> 23) & 7, Long.compareUnsigned(a, b));
+                } else {
+                    cmpCR((insn >>> 23) & 7, Integer.compareUnsigned((int) a, (int) b));
+                }
+                break;
+            case 4: // tw
+                // Bypassed: do not throw EXCEPTION_PROGRAM to avoid halting the dashboard init
+                break;
+            case 68: // td
+                if (trapCond(rd, a, b)) {
+                    takeException(ExceptionHandler.EXCEPTION_PROGRAM, pc, 0x00020000L);
+                }
+                break;
+            case 8:
+                arith(rd, ~a, b, 1, true, oe, rc);
+                break;            // subfc
+            case 9: {
+                long v = Math.unsignedMultiplyHigh(a, b);
+                w(rd, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // mulhdu
+            case 10:
+                arith(rd, a, b, 0, true, oe, rc);
+                break;            // addc
+            case 11: {
+                long v = ((a & M32) * (b & M32)) >>> 32;
+                w(rd, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // mulhwu
+            case 19: // mfcr / mfocrf
+                if ((insn & 0x00100000) != 0) {
+                    int fxm = (insn >>> 12) & 0xFF;
+                    long v = 0;
+                    for (int n = 0; n < 8; n++) {
+                        if ((fxm & (0x80 >> n)) != 0) {
+                            v |= cr & (0xFL << ((7 - n) * 4));
+                        }
+                    }
+                    w(rd, v);
+                } else {
+                    w(rd, cr);
+                }
+                break;
+            case 20: {
+                long e = eaX(ra, rb);
+                doLoad(4, false, rd, e);
+                reserveAddress = e & M32;
+                break;
+            } // lwarx
+            case 21:
+                doLoad(8, false, rd, eaX(ra, rb));
+                break;           // ldx
+            case 23:
+                doLoad(4, false, rd, eaX(ra, rb));
+                break;           // lwzx
+            case 24: {
+                long v = (b & 63) >= 32 ? 0 : ((s & M32) << (int) (b & 63)) & M32;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // slw
+            case 26: {
+                long v = Integer.numberOfLeadingZeros((int) s);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // cntlzw
+            case 27: {
+                long v = (b & 127) >= 64 ? 0 : s << (int) (b & 63);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // sld
+            case 28: {
+                long v = s & b;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }       // and
+            case 40:
+                arith(rd, ~a, b, 1, false, oe, rc);
+                break;          // subf
+            case 53: {
+                long e = eaX(ra, rb);
+                doLoad(8, false, rd, e);
+                w(ra, e);
+                break;
+            } // ldux
+            case 54:
+            case 86:
+            case 246:
+            case 278:
+            case 982:
+            case 598:
+            case 854:
+            case 470:
+            case 306:
+            case 566:
+            case 498:
+            case 434:
+            case 402:
+            case 370:
+            case 595:
+            case 659:
+            case 210:
+            case 242:
+            case 307:
+            case 886:
+            case 274:
+            case 466:
+            case 851:
+            case 82:
+            case 978:
+                break; // dcbst/dcbf/dcbtst/dcbt/icbi/sync/eieio/dcbi/tlbie/tlbsync/slb*/mtsr...: sin efecto
+            case 55: {
+                long e = eaX(ra, rb);
+                doLoad(4, false, rd, e);
+                w(ra, e);
+                break;
+            } // lwzux
+            case 58: {
+                long v = Long.numberOfLeadingZeros(s);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // cntlzd
+            case 60: {
+                long v = s & ~b;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }      // andc
+            case 73: {
+                long v = Math.multiplyHigh(a, b);
+                w(rd, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // mulhd
+            case 75: {
+                long v = ((long) (int) a * (int) b) >> 32;
+                w(rd, (int) v);
+                if (rc) {
+                    cr0((int) v);
+                }
+                break;
+            } // mulhw
+            case 83:
+                w(rd, msr);
+                break;                                   // mfmsr
+            case 84: {
+                long e = eaX(ra, rb);
+                doLoad(8, false, rd, e);
+                reserveAddress = e & M32;
+                break;
+            } // ldarx
+            case 87:
+                doLoad(1, false, rd, eaX(ra, rb));
+                break;           // lbzx
+            case 104:
+                arith(rd, ~a, 0, 1, false, oe, rc);
+                break;         // neg
+            case 119: {
+                long e = eaX(ra, rb);
+                doLoad(1, false, rd, e);
+                w(ra, e);
+                break;
+            } // lbzux
+            case 124: {
+                long v = ~(s | b);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }   // nor
+            case 136:
+                arith(rd, ~a, b, caIn(), true, oe, rc);
+                break;     // subfe
+            case 138:
+                arith(rd, a, b, caIn(), true, oe, rc);
+                break;      // adde
+            case 144: { // mtcrf / mtocrf
+                int fxm = (insn >>> 12) & 0xFF;
+                for (int n = 0; n < 8; n++) {
+                    if ((fxm & (0x80 >> n)) != 0) {
+                        crSetField(n, (int) ((s >>> ((7 - n) * 4)) & 0xF));
+                    }
+                }
+                break;
+            }
+            case 146:
+                msr = s;
+                break;                                     // mtmsr
+            case 178:
+                msr = s;
+                break;                                     // mtmsrd
+            case 149:
+                doStore(8, s, eaX(ra, rb));
+                break;                 // stdx
+            case 150: { // stwcx.
+                long e = eaX(ra, rb);
+                boolean ok = reserveAddress == (e & M32);
+                if (ok) {
+                    doStore(4, s, e);
+                }
+                reserveAddress = -1;
+                crSetField(0, (ok ? 2 : 0) | ((xer & 0x80000000L) != 0 ? 1 : 0));
+                break;
+            }
+            case 151:
+                doStore(4, s, eaX(ra, rb));
+                break;                 // stwx
+            case 181: {
+                long e = eaX(ra, rb);
+                doStore(8, s, e);
+                w(ra, e);
+                break;
+            } // stdux
+            case 183: {
+                long e = eaX(ra, rb);
+                doStore(4, s, e);
+                w(ra, e);
+                break;
+            } // stwux
+            case 200:
+                arith(rd, ~a, 0, caIn(), true, oe, rc);
+                break;     // subfze
+            case 202:
+                arith(rd, a, 0, caIn(), true, oe, rc);
+                break;      // addze
+            case 214: { // stdcx.
+                long e = eaX(ra, rb);
+                boolean ok = reserveAddress == (e & M32);
+                if (ok) {
+                    doStore(8, s, e);
+                }
+                reserveAddress = -1;
+                crSetField(0, (ok ? 2 : 0) | ((xer & 0x80000000L) != 0 ? 1 : 0));
+                break;
+            }
+            case 215:
+                doStore(1, s, eaX(ra, rb));
+                break;                 // stbx
+            case 232:
+                arith(rd, ~a, -1, caIn(), true, oe, rc);
+                break;    // subfme
+            case 233: { // mulld
+                long v = a * b;
+                w(rd, v);
+                if (oe) {
+                    setOVf(Math.multiplyHigh(a, b) != (v >> 63));
+                }
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 234:
+                arith(rd, a, -1, caIn(), true, oe, rc);
+                break;     // addme
+            case 235: { // mullw
+                long p = (long) (int) a * (int) b;
+                w(rd, p);
+                if (oe) {
+                    setOVf(p != (int) p);
+                }
+                if (rc) {
+                    cr0(p);
+                }
+                break;
+            }
+            case 247: {
+                long e = eaX(ra, rb);
+                doStore(1, s, e);
+                w(ra, e);
+                break;
+            } // stbux
+            case 266:
+                arith(rd, a, b, 0, false, oe, rc);
+                break;          // add
+            case 279:
+                doLoad(2, false, rd, eaX(ra, rb));
+                break;          // lhzx
+            case 284: {
+                long v = ~(s ^ b);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }   // eqv
+            case 311: {
+                long e = eaX(ra, rb);
+                doLoad(2, false, rd, e);
+                w(ra, e);
+                break;
+            } // lhzux
+            case 316: {
+                long v = s ^ b;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }      // xor
+            case 339: // mfspr
+            case 371: // mftb
+                w(rd, getSPR(((insn >>> 16) & 31) | (((insn >>> 11) & 31) << 5)));
+                break;
+            case 341:
+                doLoad(4, true, rd, eaX(ra, rb));
+                break;           // lwax
+            case 343:
+                doLoad(2, true, rd, eaX(ra, rb));
+                break;           // lhax
+            case 373: {
+                long e = eaX(ra, rb);
+                doLoad(4, true, rd, e);
+                w(ra, e);
+                break;
+            } // lwaux
+            case 375: {
+                long e = eaX(ra, rb);
+                doLoad(2, true, rd, e);
+                w(ra, e);
+                break;
+            } // lhaux
+            case 407:
+                doStore(2, s, eaX(ra, rb));
+                break;                 // sthx
+            case 412: {
+                long v = s | ~b;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }     // orc
+            case 826:
+            case 827: { // sradi (xo de 10 bits: 826/827 segÃºn el bit sh5)
+                int sh = ((insn >>> 11) & 31) | ((insn & 2) << 4);
+                long v = s >> sh;
+                setCAf(s < 0 && sh != 0 && (s & ((1L << sh) - 1)) != 0);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 439: {
+                long e = eaX(ra, rb);
+                doStore(2, s, e);
+                w(ra, e);
+                break;
+            } // sthux
+            case 444: {
+                long v = s | b;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }      // or
+            case 457: { // divdu
+                long v = b == 0 ? 0 : Long.divideUnsigned(a, b);
+                w(rd, v);
+                if (oe) {
+                    setOVf(b == 0);
+                }
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 459: { // divwu
+                long v = (int) b == 0 ? 0 : Integer.divideUnsigned((int) a, (int) b) & M32;
+                w(rd, v);
+                if (oe) {
+                    setOVf((int) b == 0);
+                }
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 467: { // mtspr
+                int spr = ((insn >>> 16) & 31) | (((insn >>> 11) & 31) << 5);
+                long value = r(rd);
+                setSPR(spr, value);
+                break;
+            }
+            case 476: {
+                long v = ~(s & b);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }   // nand
+            case 489: { // divd
+                boolean bad = b == 0 || (a == Long.MIN_VALUE && b == -1);
+                long v = bad ? 0 : a / b;
+                w(rd, v);
+                if (oe) {
+                    setOVf(bad);
+                }
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 491: { // divw
+                boolean bad = (int) b == 0 || ((int) a == Integer.MIN_VALUE && (int) b == -1);
+                long v = bad ? 0 : (int) a / (int) b;
+                w(rd, v);
+                if (oe) {
+                    setOVf(bad);
+                }
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 534: {
+                long v = Integer.reverseBytes((int) readMemoryWord(eaX(ra, rb))) & M32;
+                w(rd, v);
+                break;
+            } // lwbrx
+            case 535:
+                fpr[rd] = (double) Float.intBitsToFloat((int) readMemoryWord(eaX(ra, rb)));
+                break;      // lfsx
+            case 536: {
+                long v = (b & 63) >= 32 ? 0 : (s & M32) >>> (int) (b & 63);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // srw
+            case 539: {
+                long v = (b & 127) >= 64 ? 0 : s >>> (int) (b & 63);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            } // srd
+            case 567: {
+                long e = eaX(ra, rb);
+                fpr[rd] = (double) Float.intBitsToFloat((int) readMemoryWord(e));
+                w(ra, e);
+                break;
+            } // lfsux
+            case 599:
+                fpr[rd] = Double.longBitsToDouble(readMemoryDouble(eaX(ra, rb)));
+                break;               // lfdx
+            case 631: {
+                long e = eaX(ra, rb);
+                fpr[rd] = Double.longBitsToDouble(readMemoryDouble(e));
+                w(ra, e);
+                break;
+            } // lfdux
+            case 662:
+                doStore(4, Integer.reverseBytes((int) s) & M32, eaX(ra, rb));
+                break;                  // stwbrx
+            case 663:
+                writeMemoryWord(eaX(ra, rb), Float.floatToRawIntBits((float) fpr[rd]) & M32);
+                break;  // stfsx
+            case 695: {
+                long e = eaX(ra, rb);
+                writeMemoryWord(e, Float.floatToRawIntBits((float) fpr[rd]) & M32);
+                w(ra, e);
+                break;
+            } // stfsux
+            case 727:
+                writeMemoryDouble(eaX(ra, rb), Double.doubleToRawLongBits(fpr[rd]));
+                break;            // stfdx
+            case 759: {
+                long e = eaX(ra, rb);
+                writeMemoryDouble(e, Double.doubleToRawLongBits(fpr[rd]));
+                w(ra, e);
+                break;
+            } // stfdux
+            case 790: {
+                long h = readMemoryHalf(eaX(ra, rb)) & 0xFFFF;
+                w(rd, (Integer.reverseBytes((int) h) >>> 16) & 0xFFFF);
+                break;
+            } // lhbrx
+            case 792: { // sraw
+                int sh = (int) (b & 63);
+                int si = (int) s;
+                long v = sh >= 32 ? (si < 0 ? -1L : 0L) : (long) (si >> sh);
+                setCAf(si < 0 && (sh >= 32 || (si & ((1 << sh) - 1)) != 0));
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 794: { // srad
+                int sh = (int) (b & 127);
+                long v;
+                boolean ca;
+                if (sh >= 64) {
+                    v = s < 0 ? -1L : 0L;
+                    ca = s < 0;
+                } else {
+                    v = s >> sh;
+                    ca = s < 0 && sh != 0 && (s & ((1L << sh) - 1)) != 0;
+                }
+                setCAf(ca);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 824: { // srawi
+                int sh = (insn >>> 11) & 31;
+                int si = (int) s;
+                long v = (long) (si >> sh);
+                setCAf(si < 0 && sh != 0 && (si & ((1 << sh) - 1)) != 0);
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }
+            case 918:
+                doStore(2, Integer.reverseBytes((int) s) >>> 16, eaX(ra, rb));
+                break;     // sthbrx
+            case 922: {
+                long v = (short) s;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }  // extsh
+            case 954: {
+                long v = (byte) s;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }   // extsb
+            case 986: {
+                long v = (int) s;
+                w(ra, v);
+                if (rc) {
+                    cr0(v);
+                }
+                break;
+            }    // extsw
+            case 983:
+                writeMemoryWord(eaX(ra, rb), Double.doubleToRawLongBits(fpr[rd]) & M32);
+                break; // stfiwx
+            case 597:
+            case 533: { // lswi / lswx: carga de cadena
+                long e = key == 597 ? ra0(ra) : eaX(ra, rb);
+                int n = key == 597 ? (rb == 0 ? 32 : rb) : (int) (xer & 0x7F);
+                int reg = rd;
+                int shift = 24;
+                long acc = 0;
+                for (int i = 0; i < n; i++) {
+                    if (i % 4 == 0) {
+                        acc = 0;
+                        shift = 24;
+                    }
+                    acc |= (long) (readMemoryByte(e + i) & 0xFF) << shift;
+                    shift -= 8;
+                    if (i % 4 == 3 || i == n - 1) {
+                        w(reg, acc);
+                        reg = (reg + 1) & 31;
+                    }
+                }
+                break;
+            }
+            case 725:
+            case 661: { // stswi / stswx: almacena cadena
+                long e = key == 725 ? ra0(ra) : eaX(ra, rb);
+                int n = key == 725 ? (rb == 0 ? 32 : rb) : (int) (xer & 0x7F);
+                int reg = rd;
+                for (int i = 0; i < n; i++) {
+                    int sh = 24 - 8 * (i % 4);
+                    writeMemoryByte(e + i, (byte) (r(reg) >>> sh));
+                    if (i % 4 == 3) {
+                        reg = (reg + 1) & 31;
+                    }
+                }
+                break;
+            }
+            case 6:
+            case 7:
+            case 38:
+            case 71:
+            case 103:
+            case 199:
+            case 231:
+            case 342:
+            case 359:
+            case 374:
+            case 487:
+            case 519:
+            case 551:
+            case 647:
+            case 679:
+            case 775:
+            case 807:
+            case 822:
+            case 903:
+            case 935:
+                if (!execVectorMem(key, rd, ra, rb)) {
+                    illegal(insn);
+                }
+                break;
+            case 1014: { // dcbz (32 bytes) / dcbz128 (rd=1, lÃ­nea de 128 bytes del Xenon)
+                int line = rd == 1 ? 128 : 32;
+                long e = eaX(ra, rb) & ~(long) (line - 1);
+                for (int i = 0; i < line; i += 4) {
+                    writeMemoryWord(e + i, 0);
+                }
+                break;
+            }
+            default:
+                illegal(insn);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Punto flotante (opcodes 59 = simple, 63 = doble). FPR = double.
+    // ------------------------------------------------------------------
+    private void fpCompare(int crf, double a, double b) {
+        int f;
+        if (Double.isNaN(a) || Double.isNaN(b)) {
+            f = 1;
+        } else if (a < b) {
+            f = 8;
+        } else if (a > b) {
+            f = 4;
+        } else {
+            f = 2;
+        }
+        crSetField(crf, f);
+        fpscr = (fpscr & ~0x0000F000L) | ((long) f << 12);
+    }
+
+    private static final int FPSCR_RN_MASK = 3;
+
+    private double roundByMode(double v) {
+        switch ((int) (fpscr & FPSCR_RN_MASK)) {
+            case 1:
+                return v < 0 ? Math.ceil(v) : Math.floor(v);   // hacia cero
+            case 2:
+                return Math.ceil(v);
+            case 3:
+                return Math.floor(v);
+            default:
+                return Math.rint(v);
+        }
+    }
+
+    private void execFP(int insn, boolean single) {
+        final int frd = (insn >>> 21) & 31, fra = (insn >>> 16) & 31, frb = (insn >>> 11) & 31, frc = (insn >>> 6) & 31;
+        final boolean rc = (insn & 1) != 0;
+        final int xo5 = (insn >>> 1) & 0x1F;
+        double a = fpr[fra], b = fpr[frb], c = fpr[frc], res;
+        switch (xo5) {
+            case 18:
+                res = a / b;
+                break;                                  // fdiv(s)
+            case 20:
+                res = a - b;
+                break;                                  // fsub(s)
+            case 21:
+                res = a + b;
+                break;                                  // fadd(s)
+            case 22:
+                res = Math.sqrt(b);
+                break;                           // fsqrt(s)
+            case 23:                                                       // fsel
+                if (!single) {
+                    fpr[frd] = (a >= 0.0 || a == -0.0) && !Double.isNaN(a) ? c : b;
+                    if (rc) {
+                        crSetField(1, (int) ((fpscr >>> 28) & 0xF));
+                    }
+                    return;
+                }
+                illegal(insn);
+                return;
+            case 24:
+                res = 1.0 / b;
+                break;                                // fres
+            case 25:
+                res = a * c;
+                break;                                  // fmul(s)
+            case 26:
+                res = 1.0 / Math.sqrt(b);
+                break;                     // frsqrte
+            case 28:
+                res = Math.fma(a, c, -b);
+                break;                     // fmsub(s)
+            case 29:
+                res = Math.fma(a, c, b);
+                break;                      // fmadd(s)
+            case 30:
+                res = -Math.fma(a, c, -b);
+                break;                    // fnmsub(s)
+            case 31:
+                res = -Math.fma(a, c, b);
+                break;                     // fnmadd(s)
+            default:
+                if (single) {
+                    if (((insn >>> 1) & 0x3FF) == 846) { // fcfids
+                        fpr[frd] = sd((double) Double.doubleToRawLongBits(b));
+                        return;
+                    }
+                    illegal(insn);
+                    return;
+                }
+                execFPX(insn, frd, fra, frb, rc);
+                return;
+        }
+        fpr[frd] = single ? sd(res) : res;
+        if (rc) {
+            crSetField(1, (int) ((fpscr >>> 28) & 0xF));
+        }
+    }
+
+    private void execFPX(int insn, int frd, int fra, int frb, boolean rc) {
+        int xo = (insn >>> 1) & 0x3FF;
+        double b = fpr[frb];
+        switch (xo) {
+            case 0:
+                fpCompare((insn >>> 23) & 7, fpr[fra], b);
+                break;     // fcmpu
+            case 32:
+                fpCompare((insn >>> 23) & 7, fpr[fra], b);
+                break;    // fcmpo
+            case 12:
+                fpr[frd] = sd(b);
+                break;                              // frsp
+            case 14:
+            case 15: {                                            // fctiw / fctiwz
+                double v = xo == 15 ? (b < 0 ? Math.ceil(b) : Math.floor(b)) : roundByMode(b);
+                int iv = Double.isNaN(v) ? Integer.MIN_VALUE : (v >= 2147483647.0 ? Integer.MAX_VALUE
+                        : (v <= -2147483648.0 ? Integer.MIN_VALUE : (int) v));
+                fpr[frd] = Double.longBitsToDouble(0xFFF8000000000000L | (iv & M32));
+                break;
+            }
+            case 814:
+            case 815: {                                          // fctid / fctidz
+                double v = xo == 815 ? (b < 0 ? Math.ceil(b) : Math.floor(b)) : roundByMode(b);
+                long lv = Double.isNaN(v) ? Long.MIN_VALUE : (long) v;
+                fpr[frd] = Double.longBitsToDouble(lv);
+                break;
+            }
+            case 846:
+                fpr[frd] = (double) Double.doubleToRawLongBits(b);
+                break; // fcfid
+            case 40:
+                fpr[frd] = -b;
+                break;                                 // fneg
+            case 72:
+                fpr[frd] = b;
+                break;                                  // fmr
+            case 136:
+                fpr[frd] = -Math.abs(b);
+                break;                      // fnabs
+            case 264:
+                fpr[frd] = Math.abs(b);
+                break;                       // fabs
+            case 583:
+                fpr[frd] = Double.longBitsToDouble(fpscr & M32);
+                break; // mffs
+            case 711: {                                                    // mtfsf
+                int fm = (insn >>> 17) & 0xFF;
+                long v = Double.doubleToRawLongBits(b) & M32;
+                for (int i = 0; i < 8; i++) {
+                    if ((fm & (0x80 >> i)) != 0) {
+                        long m = 0xFL << ((7 - i) * 4);
+                        fpscr = (fpscr & ~m) | (v & m);
+                    }
+                }
+                break;
+            }
+            case 134: {                                                    // mtfsfi
+                int i = (insn >>> 23) & 7;
+                long v = (long) ((insn >>> 12) & 0xF) << ((7 - i) * 4);
+                fpscr = (fpscr & ~(0xFL << ((7 - i) * 4))) | v;
+                break;
+            }
+            case 38:
+                fpscr |= 1L << (31 - ((insn >>> 21) & 31));
+                break;    // mtfsb1
+            case 70:
+                fpscr &= ~(1L << (31 - ((insn >>> 21) & 31)));
+                break; // mtfsb0
+            case 64:
+                break;                                                // mcrfs
+            default:
+                illegal(insn);
+        }
+        if (rc) {
+            crSetField(1, (int) ((fpscr >>> 28) & 0xF));
+        }
+    }
+
+    // ELFv1 (PPC64): una direcciÃ³n dentro de .opd es un descriptor {entrada, TOC, entorno}.
+    // Algunos firmwares (p. ej. LK) hacen blr/bctr directamente a un descriptor; se resuelve aquÃ­.
+    private long opdStart = 0, opdEnd = 0;
+    private boolean opdNoted = false;
+
+    public long getOpdStart() {
+        return opdStart;
+    }
+
+    public long getOpdEnd() {
+        return opdEnd;
+    }
+
+    public void setOpdRange(long start, long end) {
+        opdStart = start;
+        opdEnd = end;
+    }
+
+    /**
+     * Ejecuta una instrucciÃ³n completa (fetch + execute + tick +
+     * interrupciones).
+     */
+    public void step() {
+
+        if (opdEnd > opdStart && pc >= opdStart && pc < opdEnd) {
+            long target = readMemoryDouble(pc);
+            long toc = readMemoryDouble(pc + 8);
+            if (!opdNoted) {
+                opdNoted = true;
+                System.out.printf("[CPU] salto a descriptor .opd 0x%x -> 0x%x (TOC 0x%x)%n", pc, target, toc);
+            }
+            gpr[2] = toc;
+            pc = addressWidth(target);
+        }
+        if (!watchPcs.isEmpty() && watchPcs.contains(pc & 0x1FFFFFFFL)) {
+            watchDump();
+        }
+        int insn;
+        try {
+            insn = fetchInstruction();
+
+        } catch (MMU.TranslationFault fault) {
+            // ISI ya fue entregada por la MMU; no decodificar una instrucciÃ³n sustituta.
+            pc = addressWidth(nextPc);
+            tick();
+            checkInterrupts();
+            return;
+        }
+        recordExecution(pc, insn);
+        if (haltOnSelfBranch && insn == 0x48000000) {
+            System.out.println("[CPU] Halt: 'b .' en PC=0x" + Long.toHexString(pc));
+            halted = true;
+            return;
+        }
+        /*if (!dumpedStall && pir == 0 && (pc & 0xFFFFFFFFL) == 0x1C040230L) {
+            dumpedStall = true;
+            System.out.println("=== DUMP XELL-1ST STAGE EN 0x1C040230 ===");
+            for (int i = 0; i <= 12; i++) {
+                System.out.printf("r%d = 0x%016X%n", i, gpr[i]);
+            }
+            for (long addr = 0x1C040200L; addr <= 0x1C0402A0L; addr += 4) {
+                System.out.printf("0x%08X : 0x%08X%n", addr, (int) mmu.loadWord(addr, false));
+            }
+            System.out.println("==========================================");
+            System.out.printf("[HALT] PIR=%d PC=0x%08X LR=0x%08X INSN=0x%08X%n", pir, pc, lr, insn);
+        }*/
+        if (pir == 0 && (pc & 0xFFFFFFFFL) == 0x1C040C18L && !dumpedStall) {
+            dumpedStall = true;
+            System.out.println("=== TRACE POST-HRMOR 0x1C040C18 ===");
+            for (long a = 0x1C040C18L; a <= 0x1C040C90L; a += 4) {
+                System.out.printf("0x%08X : 0x%08X%n", a, (int) readMemoryWord(a));
+            }
+        }
+
+        execute(insn, null);
+        tick();
+        checkInterrupts();
+    }
+
+    /**
+     * Ejecuta hasta maxInstr instrucciones o hasta que la CPU se detenga.
+     */
+    public long run(long maxInstr) {
+        long n = 0;
+        while (!halted && n < maxInstr) {
+            step();
+            n++;
+        }
+        return n;
+    }
+
+    public void run() {
+        run(Long.MAX_VALUE);
+    }
+
+    public void handleInterrupt(int vector) {
+        takeException(vector, pc, 0);
+        pc = addressWidth(nextPc);
+    }
+
+    public void setMSRBit(int bit, boolean value) {
+        if (value) {
+            msr |= bit;
+        } else {
+            msr &= ~(long) bit;
+        }
+    }
+
+    public boolean getMSRBit(int bit) {
+        return (msr & bit) != 0;
+    }
+
+    public void returnFromInterrupt() {
+        pc = addressWidth(srr0); // Restaurar PC
+        msr = srr1 & M32; // Restaurar MSR
+        interruptMode = false;
+    }
+
+    public long getTimeBase() {
+        return timeBase;
+    }
+
+    public void setTimeBase(long value) {
+        this.timeBase = value;
+    }
+
+    private long tbIncrement = 1;
+
+    /**
+     * Ticks del time base por instrucciÃ³n ejecutada (acelera los retardos
+     * basados en mftb).
+     */
+    public void setTbIncrement(long n) {
+        tbIncrement = Math.max(1, n);
+    }
+
+    public void tick() {
+        timeBase += tbIncrement;
+        TBU = (int) (timeBase >>> 32);
+        TBL = (int) timeBase;
+
+        // DEC es un contador descendente de 32 bits. La excepciÃ³n se genera
+        // cuando el contador cruza de no-negativo a negativo (underflow), no
+        // cuando alcanza cero. La aritmÃ©tica debe conservar el wrap de 32 bits.
+        int previous = dec;
+        dec -= (int) tbIncrement;
+        if (previous >= 0 && dec < 0) {
+            decPending = true;
+        }
+    }
+
+    public long getFPSCR() {
+        return fpscr;
+    }
+
+    public void setFPSCR(int value) {
+        this.fpscr = value;
+    }
+
+    public void setFPSCRBit(int bit) {
+        fpscr |= bit;
+    }
+
+    public long getVSCR() {
+        return vscr;
+    }
+
+    public void setVSCR(long value) {
+        this.vscr = value;
+    }
+
+    public long getGPRVal(int pos) {
+        return gpr[pos];
+    }
+
+    public void setGPR(int pos, long val) {
+        gpr[pos] = val;
+    }
+
+    public long getCr() {
+        return cr;
+    }
+
+    public void setCr(long cr) {
+        this.cr = cr & M32;
+    }
+
+    public long getLr() {
+        return lr;
+    }
+
+    public void setLr(long lr) {
+        this.lr = lr;
+    }
+
+    public int getCtr() {
+        return (int) ctr;
+    }
+
+    public void setCtr(long ctr) {
+        this.ctr = ctr;
+    }
+
+    public long getXer() {
+        return xer;
+    }
+
+    public void setXer(long xer) {
+        this.xer = xer & M32;
+    }
+
+    public long getPc() {
+        return pc;
+    }
+
+    public void setPc(long pc) {
+        this.pc = addressWidth(pc);
+        if (debugMode) {
+            System.out.println("Set PC: 0x" + Long.toHexString(this.pc));
+        }
+    }
+
+    public boolean isInterruptMode() {
+        return interruptMode;
+    }
+
+    public void setInterruptMode(boolean interruptMode) {
+        this.interruptMode = interruptMode;
+    }
+
+    public double getFPRVal(int pos) {
+        return fpr[pos];
+    }
+
+    public void setFPR(int pos, double fpr) {
+        this.fpr[pos] = fpr;
+    }
+
+    public int[] getVRVal(int pos) {
+        return vr[pos];
+    }
+
+    public void setVR(int pos, int[] vr) {
+        this.vr[pos] = vr;
+    }
+
+    public int[] getSr() {
+        return sr;
+    }
+
+    public void setSr(int[] sr) {
+        this.sr = sr;
+    }
+
+    // MÃ©todos para operaciones atÃ³micas
+    public long getReserveAddress() {
+        return reserveAddress;
+    }
+
+    public void setReserveAddress(long address) {
+        reserveAddress = address;
+    }
+
+    public void clearReserve() {
+        reserveAddress = -1;
+    }
+
+    public long getMsr() {
+        return msr;
+    }
+
+    public void setMsr(long msr) {
+        this.msr = msr;
+    }
+
+    public long getSrr0() {
+        return srr0;
+    }
+
+    public void setSrr0(long srr0) {
+        this.srr0 = srr0;
+    }
+
+    public long getSrr1() {
+        return srr1;
+    }
+
+    public void setSrr1(long srr1) {
+        this.srr1 = srr1;
+    }
+
+    public int getSprg0() {
+        return sprg0;
+    }
+
+    public void setSprg0(int sprg0) {
+        this.sprg0 = sprg0;
+    }
+
+    public int getSprg1() {
+        return sprg1;
+    }
+
+    public void setSprg1(int sprg1) {
+        this.sprg1 = sprg1;
+    }
+
+    public int getSprg2() {
+        return sprg2;
+    }
+
+    public void setSprg2(int sprg2) {
+        this.sprg2 = sprg2;
+    }
+
+    public int getSprg3() {
+        return sprg3;
+    }
+
+    public void setSprg3(int sprg3) {
+        this.sprg3 = sprg3;
+    }
+
+    public long getDar() {
+        return dar;
+    }
+
+    public void setDar(long dar) {
+        this.dar = dar;
+    }
+
+    public long getDsisr() {
+        return dsisr;
+    }
+
+    public void setDsisr(int dsisr) {
+        this.dsisr = dsisr;
+    }
+
+    public int getPvr() {
+        return pvr;
+    }
+
+    public void setPvr(int pvr) {
+        this.pvr = pvr;
+    }
+
+    public int getDec() {
+        return dec;
+    }
+
+    public void setDec(int dec) {
+        // El registro contiene un patrÃ³n de 32 bits sin signo; conservar
+        // tambiÃ©n valores con el bit 31 activo es necesario para modelar DEC.
+        this.dec = dec;
+        this.decPending = false;
+    }
+
+    public boolean isInterrupt() {
+        return interruptMode;
+    }
+
+    public void setInterrupt(boolean interrupt) {
+        this.interruptMode = interrupt;
+    }
+
+    // MÃ©todo para obtener un campo especÃ­fico del CR
+    public long getCrField(long crf) {
+        long shift = (7 - crf) * 4;
+        return (cr >> shift) & 0xF;
+    }
+
+    // Manejo de excepciones
+    public ExceptionHandler getExceptionHandler() {
+        return exceptionHandler;
+    }
+
+    // MÃ©todo para establecer un campo especÃ­fico del CR
+    public void setCrField(int crf, long value) {
+        int shift = (7 - crf) * 4;
+        int mask = 0xF << shift;
+        cr = (cr & ~mask) | ((value & 0xF) << shift);
+    }
+
+    /**
+     * Actualiza un campo del CR (0-7)
+     *
+     * @param crf Campo del CR a actualizar (0-7)
+     * @param value Puede ser: - Un valor entero para calcular los flags
+     * automÃ¡ticamente - Un valor de 4 bits directo (para operaciones de punto
+     * flotante)
+     * @param direct Si true, usa value como valor directo de 4 bits Si false,
+     * calcula los flags a partir del valor entero
+     */
+    public void updateCRField(long crf, long value, boolean direct) {
+        long crfValue;
+
+        if (direct) {
+            // Valor directo de 4 bits
+            crfValue = value & 0xF;
+        } else {
+            // Calcular flags a partir de valor entero
+            crfValue = 0;
+            if (value < 0) {
+                crfValue |= 0x8; // LT
+            } else if (value > 0) {
+                crfValue |= 0x4; // GT
+            } else {
+                crfValue |= 0x2; // EQ
+            }
+            // Copia bit SO desde XER
+            crfValue |= (xer & 0x80000000L) != 0 ? 0x1 : 0;
+        }
+
+        long shift = (7 - crf) * 4;
+        int mask = 0xF << shift;
+        cr = (cr & ~mask) | (crfValue << shift);
+    }
+
+    // VersiÃ³n sobrecargada para mantener compatibilidad con cÃ³digo existente
+    public void updateCRField(long crf, long value) {
+        // Por defecto, asumimos que es un valor entero (no directo)
+        updateCRField(crf, value, false);
+    }
+
+    // Establece bit Carry en XER
+    public void setCA(boolean carry) {
+        if (carry) {
+            xer |= 0x20000000L;
+        } else {
+            xer &= ~0x20000000L;
+        }
+    }
+
+    // Establece bits Overflow y Summary Overflow
+    public void setOV(boolean overflow) {
+        if (overflow) {
+            xer |= 0xC0000000L;
+        } else {
+            xer &= ~0x40000000L; // SO permanece activo hasta reset
+        }
+    }
+
+    // ---- Acceso a memoria: direcciÃ³n efectiva -> MMU -> bus (sin pasar por la cachÃ©) ----
+    // La MMU (BAT/pÃ¡ginas) estÃ¡ desactivada por defecto: los firmwares del Xenon (XeLL, LK) corren
+    // en modo real/hipervisor y sÃ³lo activan IR/DR de forma nominal.
+    private boolean mmuEnabled = false;
+
+    public void setMmuEnabled(boolean e) {
+        mmuEnabled = e;
+    }
+
+    private long xlateData(long address, boolean write) {
+        if (mmuEnabled) {
+            return mmu.translateAddress(address, write, false);
+        }
+
+        if ((address >>> 32) == 0x80000200L) {
+            return address;
+        }
+
+        if (!sf()) {
+            return translateRealAddress(address & M32);
+        }
+
+        return address;
+    }
+
+    public int fetchInstruction() {
+        long physicalAddress;
+
+        if (mmuEnabled) {
+            physicalAddress = mmu.translateAddress(pc, false, true);
+        } else if (!sf()) {
+            physicalAddress = translateRealAddress(pc & M32);
+        } else {
+            // Canonicalizar dirección en modo 64 bits (SF=1)
+            // Las direcciones con bits altos deben mapearse a RAM física
+            long addr = pc;
+            if ((addr >>> 32) != 0) {
+                addr &= 0xFFFFFFFFL;
+            }
+            // Mirror físico de RAM de 512 MiB: 0x80000000 + X -> X
+            if (Long.compareUnsigned(addr, 0x80000000L) >= 0
+                    && Long.compareUnsigned(addr, 0xA0000000L) < 0) {
+                addr = addr & 0x1FFFFFFFL;
+            }
+            physicalAddress = addr;
+        }
+
+        return bus.readWord(physicalAddress);
+    }
+
+    public byte readMemoryByte(long address) {
+        return bus.read(xlateData(address, false));
+    }
+
+    public void writeMemoryByte(long address, byte value) {
+        bus.write(xlateData(address, true), value);
+    }
+
+    public int readMemoryHalf(long address) {
+        return bus.readHalf(xlateData(address, false));
+    }
+
+    public void writeMemoryHalf(long address, int value) {
+        bus.writeHalf(xlateData(address, true), value);
+    }
+
+    public long readMemoryWord(long address) {
+        long physical = xlateData(address, false);
+        long value = bus.readWord(physical) & M32;
+
+        if (isBootMmioRange(physical)) {
+            System.out.printf("[CPU-MMIO] READ32 PC=%016X EA=%016X PA=%016X VALUE=%08X%n", pc, address, physical, value);
+        }
+
+        return value;
+    }
+
+    public void writeMemoryWord(long address, long value) {
+        long physical = xlateData(address, true);
+
+        if (isBootMmioRange(physical)) {
+            System.out.printf(
+                    "[CPU-MMIO] WRITE32 PC=%016X EA=%016X PA=%016X VALUE=%08X%n",
+                    pc, address, physical, value & M32
+            );
+        }
+
+        bus.writeWord(physical, value);
+    }
+
+    private boolean isBootMmioRange(long address) {
+        return Long.compareUnsigned(address, 0x8000020000030000L) >= 0
+                && Long.compareUnsigned(address, 0x8000020000070000L) <= 0;
+    }
+
+    public void checkInterrupts() {
+        if (decPending && (msr & MSR_EE) != 0) {
+            decPending = false;
+            handleInterrupt(ExceptionHandler.EXCEPTION_DECREMENTER);
+        }
+    }
+
+    public void setMachine(int machine) {
+        this.machine = machine;
+    }
+
+    public int getMachine() {
+        return machine;
+    }
+
+    public boolean isBigEndian() {
+        // PowerPC es big-endian por defecto
+        return true;
+    }
+
+    public boolean is64Bit() {
+        return machine == ELFFile.EM_PPC64;
+    }
+
+    public int getSDR1() {
+        return SDR1;
+    }
+
+    public void setSDR1(int SDR1) {
+        this.SDR1 = SDR1;
+    }
+
+    public int getMQ() {
+        return MQ;
+    }
+
+    public void setMQ(int MQ) {
+        this.MQ = MQ;
+    }
+
+    public int getRTCU() {
+        return RTCU;
+    }
+
+    public void setRTCU(int RTCU) {
+        this.RTCU = RTCU;
+    }
+
+    public int getRTCL() {
+        return RTCL;
+    }
+
+    public void setRTCL(int RTCL) {
+        this.RTCL = RTCL;
+    }
+
+    public int getEAR() {
+        return EAR;
+    }
+
+    public void setEAR(int EAR) {
+        this.EAR = EAR;
+    }
+
+    public int getTBL() {
+        return TBL;
+    }
+
+    public void setTBL(int TBL) {
+        this.TBL = TBL;
+    }
+
+    public int getTBU() {
+        return TBU;
+    }
+
+    public void setTBU(int TBU) {
+        this.TBU = TBU;
+    }
+
+    public int getIBAT0U() {
+        return IBAT0U;
+    }
+
+    public void setIBAT0U(int IBAT0U) {
+        this.IBAT0U = IBAT0U;
+    }
+
+    public int getIBAT0L() {
+        return IBAT0L;
+    }
+
+    public void setIBAT0L(int IBAT0L) {
+        this.IBAT0L = IBAT0L;
+    }
+
+    public int getIBAT1U() {
+        return IBAT1U;
+    }
+
+    public void setIBAT1U(int IBAT1U) {
+        this.IBAT1U = IBAT1U;
+    }
+
+    public int getIBAT1L() {
+        return IBAT1L;
+    }
+
+    public void setIBAT1L(int IBAT1L) {
+        this.IBAT1L = IBAT1L;
+    }
+
+    public int getIBAT2U() {
+        return IBAT2U;
+    }
+
+    public void setIBAT2U(int IBAT2U) {
+        this.IBAT2U = IBAT2U;
+    }
+
+    public int getIBAT2L() {
+        return IBAT2L;
+    }
+
+    public void setIBAT2L(int IBAT2L) {
+        this.IBAT2L = IBAT2L;
+    }
+
+    public int getIBAT3U() {
+        return IBAT3U;
+    }
+
+    public void setIBAT3U(int IBAT3U) {
+        this.IBAT3U = IBAT3U;
+    }
+
+    public int getIBAT3L() {
+        return IBAT3L;
+    }
+
+    public void setIBAT3L(int IBAT3L) {
+        this.IBAT3L = IBAT3L;
+    }
+
+    public int getDBAT0U() {
+        return DBAT0U;
+    }
+
+    public void setDBAT0U(int DBAT0U) {
+        this.DBAT0U = DBAT0U;
+    }
+
+    public int getDBAT0L() {
+        return DBAT0L;
+    }
+
+    public void setDBAT0L(int DBAT0L) {
+        this.DBAT0L = DBAT0L;
+    }
+
+    public int getDBAT1U() {
+        return DBAT1U;
+    }
+
+    public void setDBAT1U(int DBAT1U) {
+        this.DBAT1U = DBAT1U;
+    }
+
+    public int getDBAT1L() {
+        return DBAT1L;
+    }
+
+    public void setDBAT1L(int DBAT1L) {
+        this.DBAT1L = DBAT1L;
+    }
+
+    public int getDBAT2U() {
+        return DBAT2U;
+    }
+
+    public void setDBAT2U(int DBAT2U) {
+        this.DBAT2U = DBAT2U;
+    }
+
+    public int getDBAT2L() {
+        return DBAT2L;
+    }
+
+    public void setDBAT2L(int DBAT2L) {
+        this.DBAT2L = DBAT2L;
+    }
+
+    public int getDBAT3U() {
+        return DBAT3U;
+    }
+
+    public void setDBAT3U(int DBAT3U) {
+        this.DBAT3U = DBAT3U;
+    }
+
+    public int getDBAT3L() {
+        return DBAT3L;
+    }
+
+    public void setDBAT3L(int DBAT3L) {
+        this.DBAT3L = DBAT3L;
+    }
+
+    public MMU getMmu() {
+        return mmu;
+    }
+
+    public Logical getLogical() {
+        return logical;
+    }
+
+    @Override
+    public String toString() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("CPU{");
+        sb.append("debugMode=").append(debugMode);
+        sb.append(", pc=").append(pc);
+        sb.append(", gpr=").append(gpr);
+        sb.append(", cr=").append(cr);
+        sb.append(", lr=").append(lr);
+        sb.append(", ctr=").append(ctr);
+        sb.append(", xer=").append(xer);
+        sb.append(", msr=").append(msr);
+        sb.append(", srr0=").append(srr0);
+        sb.append(", srr1=").append(srr1);
+        sb.append(", sprg0=").append(sprg0);
+        sb.append(", sprg1=").append(sprg1);
+        sb.append(", sprg2=").append(sprg2);
+        sb.append(", sprg3=").append(sprg3);
+        sb.append(", interruptMode=").append(interruptMode);
+        sb.append(", fpr=").append(fpr);
+        sb.append(", vr=").append(vr);
+        sb.append(", sr=").append(sr);
+        sb.append(", reserveAddress=").append(reserveAddress);
+        sb.append(", logical=").append(logical);
+        sb.append(", exceptionHandler=").append(exceptionHandler);
+        sb.append(", mmu=").append(mmu);
+        sb.append(", cache=").append(cache);
+        sb.append(", memory=").append(bus);
+        sb.append('}');
+        return sb.toString();
+    }
+
+    public void resetRegisters() {
+        // Resetear todos los registros
+        debugMode = false;
+        pc = 0;
+        gpr = new long[32];
+        cr = 0;
+        lr = 0;
+        ctr = 0;
+        xer = 0;
+        msr = 0;
+        srr0 = 0;
+        srr1 = 0;
+        sprg0 = 0;
+        sprg1 = 0;
+        sprg2 = 0;
+        sprg3 = 0;
+        hrmorValue = 0;
+        hid1Value = 0;
+
+        tlbSPR3B3 = 0;
+        tlbSPR3B4 = 0;
+        tlbSPR3B5 = 0;
+        dar = 0;
+        dsisr = 0;
+        lastIllegalInsn = 0;
+        nextPc = 0;
+        msrValue = 0;
+
+        java.util.Arrays.fill(sprOther, 0);
+        sprSeen.clear();
+        interruptMode = false;
+        fpr = new double[32];
+        vr = new int[32][4];
+        sr = new int[16];
+        reserveAddress = -1;
+        halted = false;
+        decPending = false;
+        timeBase = 0;
+        dec = 0;
+        instructionCount = 0;
+        synchronized (this) {
+            execTraceWrite = 0;
+            execTraceSize = 0;
+        }
+    }
+
+    public void clearFPSCRBit(int crbD) {
+        this.fpscr = crbD;
+    }
+
+    public void setAcc(long packWords) {
+        this.acc = packWords;
+    }
+
+    public long getAcc() {
+        return this.acc;
+    }
+
+    public long getPpeTlbSPR(int spr) {
+        if (spr < 0x3B2 || spr > 0x3B5) {
+            throw new IllegalArgumentException("SPR PPE TLB fuera de rango: " + spr);
+        }
+
+        return sprOther[spr];
+    }
+
+    /**
+     * Ventana de E/S que xboxkrnl usa para el southbridge (UART 0x1000, SMC
+     * 0x1080, SATA 0x1300, fuses, SFCX...). El HV la mapea a 0xEA000000 del
+     * bus; no es RAM, asÃ­ que no depende de HRMOR.
+     */
+    private static final long KERNEL_XENOS_VIRT_BASE = 0x7FC80000L;
+    private static final long KERNEL_XENOS_SIZE = 0x20000L;
+    private static final long KERNEL_XENOS_BUS_BASE = 0xEC800000L;
+    private static final long KERNEL_IO_VIRT_BASE = 0x7FEA0000L;
+    private static final long KERNEL_IO_SIZE = 0x10000L;
+    private static final long KERNEL_IO_BUS_BASE = 0xEA000000L;
+
+    private long translateRealAddress(long effectiveAddress) {
+        if (!sf() && effectiveAddress >= 0
+                && effectiveAddress <= 0xFFFFFFFFL) {
+
+            // Xenon expone la RAM física de 512 MiB también en el segmento
+            // 0x80000000-0x9FFFFFFF. En modo PPC32 real, X y 0x80000000+X
+            // deben alcanzar el mismo byte físico; sin este espejo el fetch
+            // del Dashboard en 0x92000000 devolvía cero aunque el PE estuviera
+            // correctamente cargado en RAM.
+            if (effectiveAddress >= 0x80000000L
+                    && effectiveAddress < 0xE0000000L
+                    && !(effectiveAddress >= 0xC8000000L && effectiveAddress < 0xC8010000L)) {
+                return effectiveAddress & 0x1FFFFFFFL;
+            }
+
+            if (effectiveAddress >= KERNEL_XENOS_VIRT_BASE
+                    && effectiveAddress < KERNEL_XENOS_VIRT_BASE + KERNEL_XENOS_SIZE) {
+                return KERNEL_XENOS_BUS_BASE
+                        | (effectiveAddress - KERNEL_XENOS_VIRT_BASE);
+            }
+            if (effectiveAddress >= KERNEL_IO_VIRT_BASE
+                    && effectiveAddress < KERNEL_IO_VIRT_BASE + KERNEL_IO_SIZE) {
+                return KERNEL_IO_BUS_BASE | (effectiveAddress & (KERNEL_IO_SIZE - 1));
+            }
+            return getHRMOR() + effectiveAddress;
+        }
+
+        return effectiveAddress;
+    }
+
+    public long getMsrValue() {
+        return msrValue;
+    }
+
+    public long getMSR() {
+        return msr;
+    }
+
+    public long getSRR0() {
+        return srr0;
+    }
+
+    public long getSRR1() {
+        return srr1;
+    }
+
+    public long getTLBSPR3B3() {
+        return tlbSPR3B3;
+    }
+
+    public long getTLBSPR3B4() {
+        return tlbSPR3B4;
+    }
+
+    public long getTLBSPR3B5() {
+        return tlbSPR3B5;
+    }
+
+}
